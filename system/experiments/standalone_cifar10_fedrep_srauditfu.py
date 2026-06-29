@@ -107,6 +107,10 @@ class FedRepModel(nn.Module):
         in_channels: int = 3,
     ):
         super().__init__()
+        self.embedding_dim = embedding_dim
+        self.num_classes = num_classes
+        self.model_name = model_name
+        self.in_channels = in_channels
         if model_name == "small_cnn":
             self.base = ConvEncoder(embedding_dim, in_channels)
         elif model_name == "resnet18":
@@ -287,6 +291,20 @@ def maybe_cap_indices(indices: List[List[int]], max_total: int, seed: int) -> Li
 def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
     for param in module.parameters():
         param.requires_grad = requires_grad
+
+
+def release_cuda_cache(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def clone_head_state_to_cpu(model: FedRepModel) -> Dict[str, torch.Tensor]:
+    return {name: tensor.detach().cpu().clone() for name, tensor in model.head.state_dict().items()}
+
+
+def load_model_state_(dst: FedRepModel, src: FedRepModel, device: torch.device) -> None:
+    dst.load_state_dict(src.state_dict())
+    dst.to(device)
 
 
 def coral_loss(current: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
@@ -714,8 +732,14 @@ def train_selected_clients_round(
     weights = []
     losses = []
     selected_sample_count = sum(len(train_indices[cid]) for cid in selected)
+    local_model = FedRepModel(
+        global_model.embedding_dim,
+        global_model.num_classes,
+        global_model.model_name,
+        global_model.in_channels,
+    ).to(device)
     for cid in selected:
-        local_model = copy.deepcopy(global_model).to(device)
+        load_model_state_(local_model, global_model, device)
         local_model.head.load_state_dict(client_heads[cid])
         local_teacher = None
         if teacher_model is not None:
@@ -736,12 +760,15 @@ def train_selected_clients_round(
             feat_lambda=feat_lambda,
             coral_lambda=var_lambda,
         )
-        client_heads[cid] = copy.deepcopy(local_model.head.cpu().state_dict())
-        local_model.to(device)
+        client_heads[cid] = clone_head_state_to_cpu(local_model)
         update = subtract_state_dict(shared_state_dict(local_model), state_before)
         updates.append(update)
         weights.append(len(train_indices[cid]) / max(1, selected_sample_count))
         losses.append(loss)
+        del local_teacher
+        release_cuda_cache(device)
+    del local_model
+    release_cuda_cache(device)
     return aggregate_updates(state_before, updates, weights), updates, weights, losses
 
 
@@ -1295,6 +1322,7 @@ def main() -> None:
     parser.add_argument("--auditfu_subspace_rank", type=int, default=20)
     parser.add_argument("--auditfu_lr_log_rank", type=int, default=256)
     parser.add_argument("--auditfu_log_dir", default="results/standalone_cifar10_fedrep_srauditfu")
+    parser.add_argument("--trace_progress", action="store_true", help="Print fine-grained phase markers for server debugging.")
     args = parser.parse_args()
     if args.force_target_participation and args.participation_mode == "normal":
         args.participation_mode = "force_target"
@@ -1370,10 +1398,15 @@ def main() -> None:
         weights = []
         hashes = []
         losses = []
+        local_model = FedRepModel(args.embedding_dim, num_classes, args.model, in_channels).to(device)
 
         for cid in selected:
-            local_model = copy.deepcopy(global_model).to(device)
+            if args.trace_progress:
+                print(f"[trace] round={round_id + 1} client={cid} load_state", flush=True)
+            load_model_state_(local_model, global_model, device)
             local_model.head.load_state_dict(client_heads[cid])
+            if args.trace_progress:
+                print(f"[trace] round={round_id + 1} client={cid} train_start", flush=True)
             loss = train_one_client(
                 local_model,
                 train_loaders[cid],
@@ -1383,8 +1416,9 @@ def main() -> None:
                 args.lr_head,
                 args.lr_encoder,
             )
-            client_heads[cid] = copy.deepcopy(local_model.head.cpu().state_dict())
-            local_model.to(device)
+            if args.trace_progress:
+                print(f"[trace] round={round_id + 1} client={cid} update_start", flush=True)
+            client_heads[cid] = clone_head_state_to_cpu(local_model)
             update = subtract_state_dict(shared_state_dict(local_model), state_before)
             weight = len(train_indices[cid]) / max(1, sum(len(train_indices[x]) for x in selected))
             record = audit_logger.log_client_update(round_id, cid, weight, update)
@@ -1395,9 +1429,12 @@ def main() -> None:
             weights.append(weight)
             hashes.append(record.update_hash)
             losses.append(loss)
+            release_cuda_cache(device)
 
         aggregate = aggregate_updates(state_before, updates, weights)
         apply_shared_update_(global_model, aggregate)
+        del local_model
+        release_cuda_cache(device)
         state_after = shared_state_dict(global_model)
         audit_logger.log_round(round_id, selected, state_before, state_after, hashes)
         phase_times["train_rounds"].append(time.time() - t0)
