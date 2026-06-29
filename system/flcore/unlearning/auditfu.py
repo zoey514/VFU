@@ -240,19 +240,36 @@ class SRAuditConfig:
 
 
 class LowRankProjector:
-    """Deterministic Gaussian random projection for LR-Log."""
+    """Deterministic Gaussian random projection for LR-Log.
+
+    The projection is generated in chunks instead of materializing a
+    rank-by-parameter-count matrix. ResNet-18 has millions of shared
+    parameters, so storing the full Gaussian matrix can exceed server cgroup
+    limits before training finishes one round.
+    """
 
     def __init__(self, input_dim: int, rank: int, seed: int, device: torch.device = torch.device("cpu")):
         if rank <= 0:
             raise ValueError("rank must be positive")
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(seed)
-        matrix = torch.randn(rank, input_dim, generator=generator, dtype=torch.float32)
-        self.matrix = matrix / math.sqrt(rank)
+        self.input_dim = int(input_dim)
+        self.rank = int(rank)
+        self.seed = int(seed)
         self.device = device
+        self.chunk_size = 16384
 
     def project(self, vector: torch.Tensor) -> torch.Tensor:
-        return self.matrix.to(vector.device).matmul(vector.detach().float().reshape(-1))
+        flat = vector.detach().float().reshape(-1).cpu()
+        if flat.numel() != self.input_dim:
+            raise ValueError(f"Projection input size changed: expected {self.input_dim}, got {flat.numel()}.")
+        out = torch.zeros(self.rank, dtype=torch.float32)
+        scale = 1.0 / math.sqrt(self.rank)
+        for offset in range(0, self.input_dim, self.chunk_size):
+            chunk = flat[offset : offset + self.chunk_size]
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.seed + offset // self.chunk_size)
+            matrix = torch.randn(self.rank, chunk.numel(), generator=generator, dtype=torch.float32)
+            out.add_(matrix.matmul(chunk), alpha=scale)
+        return out.to(self.device)
 
 
 class AuditLogger:
