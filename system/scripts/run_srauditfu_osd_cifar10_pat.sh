@@ -21,6 +21,7 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
   --auditfu_mask topk \
   --auditfu_topk_ratio 0.1 \
   --auditfu_subspace_rank 20 \
+  --enable_osd \
   --osd_lr 0.0004 \
   --osd_max_batches 1 \
   --osd_retain_clients 10 \

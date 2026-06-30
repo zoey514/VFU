@@ -1,6 +1,6 @@
 # SR-AuditFU 中文说明
 
-本项目实现的是面向共享表征式个性化联邦学习的可审计客户端遗忘方法。当前主方法已经按研究报告升级为 **SR-AuditFU-OSD**：在原 SR-AuditFU 的共享编码器审计、MCR、目标子空间投影 repair 基础上，融合 FedOSD 的 **Unlearning Cross-Entropy (UCE)**、**Orthogonal Steepest Descent (OSD)** 和 recovery 阶段梯度投影。
+本项目实现的是面向共享表征式个性化联邦学习的可审计客户端遗忘方法。根据 ResNet-18 全量 CIFAR-10 结果，当前主方法已简化为 **SR-AuditFU-Core**：保留可审计更新日志、top-k 稀疏目标贡献移除和 retained-client 表征修复三个核心模块。FedOSD 的 UCE/OSD、target-subspace projection 和 recovery 方向投影保留为 baseline 或 ablation，不再作为默认主链路。
 
 项目当前同时提供两条运行路径：
 
@@ -9,86 +9,69 @@
 
 ## 方法概览
 
-SR-AuditFU 的完整流程分为五个阶段。
+SR-AuditFU-Core 的完整流程围绕三个核心模块展开。共享表征训练和最终评估是实验流程的一部分，但不作为方法创新模块包装。
 
-1. 共享表征训练
+### 核心模块一：Auditable Contribution Logging
 
-   每个客户端模型由共享编码器和本地头组成：
+每个客户端模型由共享编码器和本地头组成：
 
-   ```text
-   f_i(x) = h_i(phi(x))
-   ```
+```text
+f_i(x) = h_i(phi(x))
+```
 
-   其中 `phi` 是共享编码器，代码中对应 `model.base`；`h_i` 是第 `i` 个客户端的本地头，代码中对应 `model.head`。训练采用 FedRep 风格：先固定共享编码器训练本地头，再固定本地头训练共享编码器。服务器只聚合共享编码器的参数更新。
+其中 `phi` 是共享编码器，代码中对应 `model.base`；`h_i` 是第 `i` 个客户端的本地头，代码中对应 `model.head`。训练采用 FedRep 风格：先固定共享编码器训练本地头，再固定本地头训练共享编码器。服务器只聚合共享编码器的参数更新。
 
-2. 训练日志与执行审计
+每轮训练会记录共享编码器更新、参与客户端、聚合前后模型哈希、更新 Merkle root、VRF-style seed 和 hash-chain。这样后续遗忘不是只给一个结果模型，而是能给出可复查的执行证据。
 
-   每轮训练会记录共享编码器更新、参与客户端、聚合前后模型哈希、更新 Merkle root、VRF-style seed 和 hash-chain。这样后续遗忘不是只给一个结果模型，而是能给出可复查的执行证据。
+### 核心模块二：Sparse Target Contribution Removal
 
-3. 目标客户端历史贡献移除 MCR
+当目标客户端 `target_client` 请求遗忘时，系统从日志中找出它参与过的所有轮次，按时间衰减累计它对共享编码器的贡献：
 
-   当目标客户端 `target_client` 请求遗忘时，系统从日志中找出它参与过的所有轮次，按时间衰减累计它对共享编码器的贡献：
+```text
+C_u = sum_t decay^(T-t) * aggregation_weight_t * delta_theta_u_t
+```
 
-   ```text
-   C_u = sum_t decay^(T-t) * aggregation_weight_t * delta_theta_u_t
-   ```
+随后对贡献向量做 mask。目前支持三种 mask：
 
-   随后对贡献向量做 mask。目前支持三种 mask：
+- `full`：移除全部目标贡献。
+- `topk`：只移除绝对值最大的 top-k 坐标，当前默认配置。
+- `relative`：只移除目标贡献在总贡献中占比足够高的坐标。
 
-   - `full`：移除全部目标贡献。
-   - `topk`：只移除绝对值最大的 top-k 坐标，当前默认配置。
-   - `relative`：只移除目标贡献在总贡献中占比足够高的坐标。
+### 核心模块三：Retained-Client Representation Repair
 
-   MCR 阶段执行：
+MCR 会降低 retained clients 的 utility，因此主方法在 retained clients 上执行轻量 repair。当前 core repair 默认使用：
 
-   ```text
-   theta_after_mcr = theta_before_unlearn - mcr_strength * masked_contribution
-   ```
+- CE：保持 retained clients 的分类能力。
+- KD：让 repair 后模型贴近遗忘前教师模型的 logits。
+- feature mean stability：降低 retained 表征漂移。
+- prox：约束共享编码器不要过度偏离遗忘前模型。
 
-4. UCE + OSD 主动遗忘
+`variance/CORAL`、target-subspace projection、UCE/OSD 和 recovery-direction projection 均作为可选增强或 ablation，不再默认进入 core 主方法。
 
-   按 FedOSD 思路，目标客户端先使用 UCE 损失：
+MCR 阶段执行：
 
-   ```text
-   L_UCE = -log(1 - p_true / 2)
-   ```
+```text
+theta_after_mcr = theta_before_unlearn - mcr_strength * masked_contribution
+```
 
-   相比直接梯度上升，UCE 有界，能降低梯度爆炸风险。然后计算目标客户端 UCE 梯度 `g_u`，并将其投影到 retained clients 梯度矩阵的正交补空间：
+standalone 路径中的 core repair 损失为：
 
-   ```text
-   d = g_u - A^T (A A^T)^+ A g_u
-   ```
+```text
+CE(retain labels)
++ lambda_kd * KL(pre logits || current logits)
++ lambda_feat * embedding mean alignment
++ lambda_prox * ||phi - phi_pre||^2
+```
 
-   其中 `A` 是 retained clients 的共享编码器梯度矩阵。主方法在 MCR 后继续执行这个 UCE/OSD 更新。
+遗忘后系统会输出多个维度指标：
 
-5. 目标子空间约束 repair
-
-   MCR 会降低目标客户端残留，但也可能伤害 retained clients 的效用。因此系统会在非目标客户端上做 repair。repair 不是普通 fine-tune，而是受到目标子空间约束：
-
-   - 先用 masked target deltas 构造目标贡献子空间。
-   - retained clients 本地执行带稳定项的 repair。
-   - repair 聚合更新先剔除与 OSD 遗忘方向同向的分量，模拟 FedOSD recovery 投影，避免模型回退。
-   - 服务器再将聚合向量正交投影到目标贡献子空间的补空间，避免 repair 把目标客户端方向重新加回来。
-
-   standalone 路径中的 repair 损失为：
-
-   ```text
-   CE(retain labels)
-   + lambda_kd * KL(pre logits || current logits)
-   + lambda_feat * (embedding mean alignment + lambda_var * coordinate variance alignment)
-   ```
-
-6. 黑盒效果审计与综合评分
-
-   遗忘后系统会输出多个维度指标：
-
-   - retained utility：保留客户端准确率、macro-F1、新客户端头适配表现。
-   - forgetting：task-inference AUC、MIA AUC、target CKA、参数距离、mask 稀疏度。
-   - representation：坐标方差、成对内积、Mahalanobis 分数、目标是否落入 retained 分布区间。
-   - execution audit：hash-chain、Merkle root、VRF seed、repair 记录是否可验证。
-   - system cost：训练、repair、MCR、audit 时间，以及通信和存储估计。
-   - report_metrics：按研究报告命名输出 `R-Acc`、`ASR`、`MIA-AUC`、`TIA-AUC`、`CKA`、`Dist-to-theta_T`、`AuditPass`。
-   - audit_score：保留综合 gate 分数，用于判定实验是否可解释。
+- retained utility：保留客户端准确率、macro-F1、新客户端头适配表现。
+- forgetting：task-inference AUC、MIA AUC、target CKA、参数距离、mask 稀疏度。
+- representation：坐标方差、成对内积、Mahalanobis 分数、目标是否落入 retained 分布区间。
+- execution audit：hash-chain、Merkle root、VRF seed、repair 记录是否可验证。
+- system cost：训练、repair、MCR、audit 时间，以及通信和存储估计。
+- report_metrics：按研究报告命名输出 `R-Acc`、`ASR`、`MIA-AUC`、`TIA-AUC`、`CKA`、`Dist-to-theta_T`、`AuditPass`。
+- audit_score：保留综合 gate 分数，用于判定实验是否可解释。
 
 ## 目录和文件职责
 
@@ -231,7 +214,7 @@ results/smoke_report_mods/metrics_flat.csv
 - `execution_audit.exec_audit_pass` 是否为 `true`。
 - `execution_audit.round_records` 是否等于训练轮数。
 - `execution_audit.repair_round_records` 是否等于 repair 轮数。
-- `baselines` 是否包含 `Retrain`、`NoUnlearn`、`Fine-tune`、`MCR-only`、`MCR+Repair`、`FedOSD-Adapted`、`SR-AuditFU`、`SR-AuditFU-OSD` 中已启用的方法。
+- `baselines` 是否包含 `Retrain`、`NoUnlearn`、`Fine-tune`、`MCR-only`、`FedOSD-Adapted`、`SR-AuditFU`、`SR-AuditFU-Core` 中已启用的方法。
 - `report_metrics` 是否包含 `R-Acc`、`ASR`、`MIA-AUC`、`TIA-AUC`、`CKA`、`Dist-to-theta_T`、`AuditPass`。
 - `audit_score.score_valid` 是否为 `true`。如果为 `false`，先看 `audit_score.invalid_reasons`，不要直接解释遗忘指标。
 
@@ -248,7 +231,7 @@ results/smoke_report_mods/metrics_flat.csv
 - repair 默认 `repair_rounds=20`。
 - mask 默认 top-10%，即 `auditfu_topk_ratio=0.1`。
 - 贡献子空间 PCA/SVD rank 默认 `auditfu_subspace_rank=20`。
-- OSD 学习率默认 `osd_lr=0.0004`，参考 FedOSD README 的 unlearning 命令。
+- OSD 学习率默认 `osd_lr=0.0004`，仅用于 `FedOSD-Adapted` baseline 或显式 `--enable_osd` 的 ablation。
 
 注意：`--dataset femnist` 当前使用 torchvision `EMNIST(split="byclass")` 作为可运行代理，并继续使用本脚本的 Dirichlet/pathological 联邦划分；它不是 LEAF FEMNIST 的原始 writer-natural split。
 
@@ -302,14 +285,14 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
 - `NoUnlearn`：不执行遗忘。
 - `Fine-tune`：UCE-only target update，不做 OSD 和 repair。
 - `MCR-only`：只做贡献移除。
-- `MCR+Repair`：MCR 后做 KD/feature repair，但不做 OSD 和目标子空间投影。
+- `MCR+Repair`：MCR 后做 KD/feature/prox repair，但不做 OSD 和目标子空间投影。该设置与 `SR-AuditFU-Core` 的性能路径高度重叠，默认不跑；需要复核冗余 ablation 时加 `--include_redundant_baselines`。
 - `FedOSD-Adapted`：直接对共享编码器做 UCE/OSD，不做 MCR 和 SR-AuditFU 子空间 repair。
 - `SR-AuditFU`：原始 MCR + target-subspace projected repair，不含 UCE/OSD。
-- `SR-AuditFU-OSD`：本文方法，MCR + UCE/OSD + recovery 方向投影 + target-subspace repair。
+- `SR-AuditFU-Core`：本文默认主方法，auditable logging + top-k MCR + retained-client KD/feature/prox repair。
 
 ## ResNet-18 版本
 
-如果希望使用更强的共享编码器，可以选择 ResNet-18。根据当前 10 客户端、全量 CIFAR-10、50 轮训练、10 轮 repair 的结果，主方法的 utility 和 audit 已经通过，但 `TIA-AUC`、retained `CKA` 和 target/retain CKA ratio 仍需要加强。因此推荐优先使用下面的 tuned 配置：
+如果希望使用更强的共享编码器，可以选择 ResNet-18。根据当前 10 客户端、全量 CIFAR-10 实验结果，推荐优先运行三核心模块版配置：
 
 ```bash
 PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_srauditfu.py \
@@ -323,8 +306,8 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
   --participation_mode force_target \
   --target_client 0 \
   --global_rounds 50 \
-  --repair_rounds 10 \
-  --repair_early_stop_patience 6 \
+  --repair_rounds 15 \
+  --repair_early_stop_patience 8 \
   --head_epochs 1 \
   --encoder_epochs 1 \
   --batch_size 32 \
@@ -333,24 +316,22 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
   --classes_per_client 2 \
   --auditfu_mask topk \
   --auditfu_topk_ratio 0.2 \
-  --auditfu_mcr_strength 1.5 \
+  --auditfu_mcr_strength 1.2 \
   --auditfu_subspace_rank 20 \
-  --osd_lr 0.0004 \
-  --osd_max_batches 1 \
-  --osd_retain_clients 10 \
-  --repair_strength 0.15 \
+  --disable_osd \
+  --repair_strength 0.12 \
   --repair_kd_lambda 0.5 \
   --repair_kd_temp 2.0 \
-  --repair_feat_lambda 1.0 \
-  --repair_var_lambda 0.2 \
-  --repair_prox_lambda 0.02 \
-  --repair_subspace_lambda 1.5 \
+  --repair_feat_lambda 1.5 \
+  --repair_var_lambda 0.0 \
+  --repair_prox_lambda 0.05 \
+  --repair_subspace_lambda 0.0 \
   --task_auc_tolerance 0.05 \
   --retrain_rounds 200 \
   --retrain_join_ratio 1.0 \
   --retrain_encoder_epochs 2 \
   --retrain_lr_encoder 0.01 \
-  --auditfu_log_dir results/resnet18_cifar10_pat_forgetting_tuned
+  --auditfu_log_dir results/resnet18_cifar10_pat_core
 ```
 
 也可以直接运行脚本：
@@ -359,17 +340,19 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
 bash system/scripts/run_resnet18_cifar10_pat_forgetting_tuned.sh
 ```
 
-脚本默认读取服务器上的 `/root/autodl-tmp/VFU_data`，结果默认写入 `/root/autodl-tmp/VFU_results/resnet18_cifar10_pat_forgetting_tuned`。如果你的服务器路径不同，可以这样覆盖：
+脚本默认读取服务器上的 `/root/autodl-tmp/VFU_data`，结果默认写入 `/root/autodl-tmp/VFU_results/resnet18_cifar10_pat_core`。如果你的服务器路径不同，可以这样覆盖：
 
 ```bash
 DATA_DIR=/your/cifar10/path LOG_DIR=/your/result/path bash system/scripts/run_resnet18_cifar10_pat_forgetting_tuned.sh
 ```
 
-这组参数相对上一轮结果做了四个调整：
+这组参数相对上一轮 OSD-heavy 结果做了五个调整：
 
-- `auditfu_mcr_strength=1.5` 和 `repair_subspace_lambda=1.5`：增强目标客户端贡献移除和目标子空间约束，优先改善 `TIA-AUC` 与 `Target-CKA`。
-- `repair_strength=0.15`：减小每轮 repair 写回步长，降低 retained 表征被过度扰动的风险。
-- `repair_feat_lambda=1.0`、`repair_var_lambda=0.2`、`repair_prox_lambda=0.02`：增强 retained 表征稳定约束，目标是提升 retained `CKA`。
+- `--disable_osd` 和 `repair_subspace_lambda=0.0`：默认主链路只保留三核心模块，OSD 和 target-subspace projection 放入 ablation。
+- `auditfu_mcr_strength=1.2`：避免过强 MCR 同时破坏 retained 表征。
+- `repair_rounds=15`、`repair_early_stop_patience=8`：给 retained repair 更充分恢复空间。
+- `repair_strength=0.12`、`repair_feat_lambda=1.5`、`repair_prox_lambda=0.05`：降低单轮写回幅度并增强 retained 表征稳定。
+- `repair_var_lambda=0.0`：默认移除 variance/CORAL 项，降低 repair 正则冗余。
 - `task_auc_tolerance=0.05`：将 TIA 判定改为 `abs(TIA-AUC - 0.5) <= 0.05`，避免 AUC 过低时被误判为真正不可区分。
 - `retrain_rounds=200`、`retrain_join_ratio=1.0`、`retrain_encoder_epochs=2`、`retrain_lr_encoder=0.01`：将 `Retrain` 作为更强的 oracle upper-bound baseline，避免因训练不足导致上界偏低。该设置的通信和训练预算高于主方法，不应作为同预算 baseline 解读。
 
@@ -488,7 +471,7 @@ DATA_DIR=/your/cifar10/path LOG_DIR=/your/result/path bash system/scripts/run_re
 - `Target/Retain-CKA`：目标变化与 retained 稳定性的相对关系，越低越符合“忘 target、保 retained”的目标。
 - `Dist-to-theta_T`：相对于遗忘前共享模型的参数距离。
 
-这项改动用于避免只按 retained accuracy 排序。比如 `FedOSD-Adapted` 可能拥有更高的 `R-Acc`，但如果 `TIA-AUC`、`Target-CKA` 或 `Target/Retain-CKA` 更差，就不能说明它整体优于 SR-AuditFU-OSD。
+这项改动用于避免只按 retained accuracy 排序。比如 `FedOSD-Adapted` 可能拥有更高的 `R-Acc`，但如果 `TIA-AUC`、`Target-CKA` 或 `Target/Retain-CKA` 更差，就不能说明它整体优于 SR-AuditFU-Core。
 
 在 `threshold_checks` 中，推荐优先看 `task_inf_post_mahalanobis_abs_le_tol`，它使用双侧判据：
 

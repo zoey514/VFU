@@ -322,6 +322,7 @@ def fedrep_batch_loss(
     kd_temp: float = 2.0,
     feat_lambda: float = 0.0,
     coral_lambda: float = 1.0,
+    prox_lambda: float = 0.0,
 ) -> torch.Tensor:
     features = model.base(x)
     logits = model.head(features)
@@ -347,6 +348,13 @@ def fedrep_batch_loss(
         mean_loss = F.mse_loss(features.mean(dim=0), teacher_features.mean(dim=0))
         cov_loss = coral_loss(features, teacher_features)
         loss = loss + feat_lambda * (mean_loss + coral_lambda * cov_loss)
+    if prox_lambda > 0.0:
+        prox = features.new_tensor(0.0)
+        count = 0
+        for param, anchor in zip(model.base.parameters(), teacher_model.base.parameters()):
+            prox = prox + F.mse_loss(param, anchor.detach())
+            count += 1
+        loss = loss + prox_lambda * prox / max(1, count)
     return loss
 
 
@@ -363,6 +371,7 @@ def train_one_client(
     kd_temp: float = 2.0,
     feat_lambda: float = 0.0,
     coral_lambda: float = 1.0,
+    prox_lambda: float = 0.0,
 ) -> float:
     model.train()
     if teacher_model is not None:
@@ -378,7 +387,7 @@ def train_one_client(
             x, y = x.to(device), y.to(device)
             head_opt.zero_grad(set_to_none=True)
             loss = fedrep_batch_loss(
-                model, x, y, teacher_model, kd_lambda, kd_temp, feat_lambda, coral_lambda
+                model, x, y, teacher_model, kd_lambda, kd_temp, feat_lambda, coral_lambda, prox_lambda
             )
             loss.backward()
             head_opt.step()
@@ -393,7 +402,7 @@ def train_one_client(
             x, y = x.to(device), y.to(device)
             encoder_opt.zero_grad(set_to_none=True)
             loss = fedrep_batch_loss(
-                model, x, y, teacher_model, kd_lambda, kd_temp, feat_lambda, coral_lambda
+                model, x, y, teacher_model, kd_lambda, kd_temp, feat_lambda, coral_lambda, prox_lambda
             )
             loss.backward()
             encoder_opt.step()
@@ -726,6 +735,7 @@ def train_selected_clients_round(
     kd_temp: float = 2.0,
     feat_lambda: float = 0.0,
     var_lambda: float = 1.0,
+    prox_lambda: float = 0.0,
 ) -> Tuple[Dict[str, torch.Tensor], List[Mapping[str, torch.Tensor]], List[float], List[float]]:
     state_before = shared_state_dict(global_model)
     updates = []
@@ -759,6 +769,7 @@ def train_selected_clients_round(
             kd_temp=kd_temp,
             feat_lambda=feat_lambda,
             coral_lambda=var_lambda,
+            prox_lambda=prox_lambda,
         )
         client_heads[cid] = clone_head_state_to_cpu(local_model)
         update = subtract_state_dict(shared_state_dict(local_model), state_before)
@@ -944,6 +955,7 @@ def run_repair_procedure(
             kd_temp=args.repair_kd_temp,
             feat_lambda=args.repair_feat_lambda if use_teacher else 0.0,
             var_lambda=args.repair_var_lambda,
+            prox_lambda=args.repair_prox_lambda if use_teacher else 0.0,
         )
         hashes = []
         update_bytes = 0
@@ -1347,7 +1359,7 @@ def main() -> None:
     parser.add_argument("--osd_lr", type=float, default=0.0004)
     parser.add_argument("--osd_max_batches", type=int, default=1)
     parser.add_argument("--osd_retain_clients", type=int, default=10)
-    parser.add_argument("--enable_osd", dest="enable_osd", action="store_true", default=True)
+    parser.add_argument("--enable_osd", dest="enable_osd", action="store_true", default=False)
     parser.add_argument("--disable_osd", dest="enable_osd", action="store_false")
     parser.add_argument("--repair_kd_lambda", type=float, default=0.5)
     parser.add_argument("--repair_kd_temp", type=float, default=2.0)
@@ -1362,6 +1374,7 @@ def main() -> None:
     parser.add_argument("--min_pre_retain_acc", type=float, default=0.45)
     parser.add_argument("--min_retain_score", type=float, default=0.9)
     parser.add_argument("--skip_baselines", action="store_true")
+    parser.add_argument("--include_redundant_baselines", action="store_true")
     parser.add_argument("--baseline_rounds", type=int, default=-1)
     parser.add_argument("--skip_retrain_baseline", action="store_true")
     parser.add_argument("--retrain_rounds", type=int, default=-1)
@@ -1443,7 +1456,7 @@ def main() -> None:
     communication = {"train_upload_bytes": 0, "train_download_bytes": 0, "repair_upload_bytes": 0, "repair_download_bytes": 0}
 
     print(
-        f"SR-AuditFU-OSD setup: dataset={args.dataset}, split={args.split_mode}, "
+        f"SR-AuditFU-Core setup: dataset={args.dataset}, split={args.split_mode}, "
         f"clients={args.num_clients}, join_clients={join_clients}, alpha={args.alpha}, "
         f"NC={args.classes_per_client}, target_client={args.target_client}"
     )
@@ -1544,11 +1557,11 @@ def main() -> None:
     print(
         f"Unlearn target client {args.target_client}: records={len(target_records)}, "
         f"basis_rank={0 if target_basis is None else target_basis.shape[1]}, "
-        f"mask={audit_cfg.mask}, osd={args.enable_osd}"
+        f"mask={audit_cfg.mask}, osd={args.enable_osd}, core_modules=True"
     )
 
     global_model, client_heads, full_repair_info = run_repair_procedure(
-        "SR-AuditFU-OSD",
+        "SR-AuditFU-Core",
         global_model,
         client_heads,
         pre_unlearn_model,
@@ -1558,16 +1571,16 @@ def main() -> None:
         train_indices,
         retained_clients,
         args.target_client,
-        target_basis,
+        None,
         join_clients,
         args,
         device,
-        use_projection=True,
+        use_projection=False,
         use_teacher=True,
         audit_logger=audit_logger,
         phase_times=phase_times,
         communication=communication,
-        recovery_direction=osd_direction,
+        recovery_direction=None,
     )
 
     baseline_rounds = args.repair_rounds if args.baseline_rounds < 0 else args.baseline_rounds
@@ -1581,19 +1594,19 @@ def main() -> None:
             "metrics": mcr_metrics,
             "description": "Apply masked contribution removal without retained-client repair.",
         },
-        "SR-AuditFU-OSD": {
+        "SR-AuditFU-Core": {
             "metrics": full_repair_info["best_metrics"],
             "history": full_repair_info["history"],
             "best_round": full_repair_info["best_round"],
             "completed_rounds": full_repair_info["completed_rounds"],
             "osd": osd_metrics,
-            "description": "MCR + UCE/OSD + recovery-direction projection + target-subspace repair.",
+            "description": "Core method: auditable logging + sparse MCR + retained-client KD/feature/prox repair.",
         },
     }
     baseline_artifacts: Dict[str, Tuple[FedRepModel, Sequence[Mapping[str, torch.Tensor]]]] = {
         "NoUnlearn": (pre_unlearn_model, pre_unlearn_heads),
         "MCR-only": (mcr_model, pre_unlearn_heads),
-        "SR-AuditFU-OSD": (global_model, client_heads),
+        "SR-AuditFU-Core": (global_model, client_heads),
     }
     if not args.skip_baselines:
         finetune_uce_model = copy.deepcopy(pre_unlearn_model).to(device)
@@ -1616,33 +1629,34 @@ def main() -> None:
         }
         baseline_artifacts["Fine-tune"] = (finetune_uce_model, finetune_uce_heads)
 
-        mcr_repair_model, mcr_repair_heads, mcr_repair_info = run_repair_procedure(
-            "MCR+Repair",
-            mcr_model,
-            pre_unlearn_heads,
-            pre_unlearn_model,
-            pre_unlearn_heads,
-            train_loaders,
-            test_loaders,
-            train_indices,
-            retained_clients,
-            args.target_client,
-            None,
-            join_clients,
-            args,
-            device,
-            use_projection=False,
-            use_teacher=True,
-            repair_rounds=baseline_rounds,
-        )
-        baseline_metrics["MCR+Repair"] = {
-            "metrics": mcr_repair_info["best_metrics"],
-            "history": mcr_repair_info["history"],
-            "best_round": mcr_repair_info["best_round"],
-            "completed_rounds": mcr_repair_info["completed_rounds"],
-            "description": "MCR-only followed by KD/feature repair, without FedOSD OSD or target-subspace projection.",
-        }
-        baseline_artifacts["MCR+Repair"] = (mcr_repair_model, mcr_repair_heads)
+        if args.include_redundant_baselines:
+            mcr_repair_model, mcr_repair_heads, mcr_repair_info = run_repair_procedure(
+                "MCR+Repair",
+                mcr_model,
+                pre_unlearn_heads,
+                pre_unlearn_model,
+                pre_unlearn_heads,
+                train_loaders,
+                test_loaders,
+                train_indices,
+                retained_clients,
+                args.target_client,
+                None,
+                join_clients,
+                args,
+                device,
+                use_projection=False,
+                use_teacher=True,
+                repair_rounds=baseline_rounds,
+            )
+            baseline_metrics["MCR+Repair"] = {
+                "metrics": mcr_repair_info["best_metrics"],
+                "history": mcr_repair_info["history"],
+                "best_round": mcr_repair_info["best_round"],
+                "completed_rounds": mcr_repair_info["completed_rounds"],
+                "description": "Redundant ablation: MCR-only followed by the same KD/feature/prox repair used by SR-AuditFU-Core.",
+            }
+            baseline_artifacts["MCR+Repair"] = (mcr_repair_model, mcr_repair_heads)
 
         sr_auditfu_model, sr_auditfu_heads, sr_auditfu_info = run_repair_procedure(
             "SR-AuditFU",
@@ -2016,7 +2030,7 @@ def main() -> None:
         return row
 
     report_metrics = {
-        "SR-AuditFU-OSD": {
+        "SR-AuditFU-Core": {
             "R-Acc": float(after_metrics["retain_mean_acc"]),
             "ASR": float(after_metrics.get("target_client_acc", 0.0)),
             "MIA-AUC": float(forgetting_metrics["mia_auc_post_loss"]),
@@ -2046,7 +2060,7 @@ def main() -> None:
             "dataset": args.dataset,
             "split_mode": args.split_mode,
             "classes_per_client": args.classes_per_client,
-            "algorithm": "FedRep+SRAuditFU-OSD",
+            "algorithm": "FedRep+SRAuditFU-Core",
             "model": args.model,
             "target_client": args.target_client,
             "retain_clients": retained_clients,
@@ -2067,7 +2081,7 @@ def main() -> None:
             "standalone_runner": True,
             "dataset": args.dataset,
             "split_mode": args.split_mode,
-            "algorithm": "FedRep+SRAuditFU-OSD",
+            "algorithm": "FedRep+SRAuditFU-Core",
             "target_client": args.target_client,
             "target_record_count": len(target_records),
             "basis_rank": 0 if target_basis is None else int(target_basis.shape[1]),
