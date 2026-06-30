@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DATA_DIR="${DATA_DIR:-/root/autodl-tmp/VFU_data}"
+LOG_DIR="${LOG_DIR:-/root/autodl-tmp/VFU_results/resnet18_cifar10_pat_forgetting_tuned}"
+
 PYTHONPATH=${PYTHONPATH:-system} python -u system/experiments/standalone_cifar10_fedrep_srauditfu.py \
+  --data_dir "$DATA_DIR" \
+  --download \
   --dataset cifar10 \
   --model resnet18 \
   --device cuda \
@@ -35,4 +40,4 @@ PYTHONPATH=${PYTHONPATH:-system} python -u system/experiments/standalone_cifar10
   --min_pre_retain_acc 0.45 \
   --min_retain_score 0.9 \
   --retrain_rounds 100 \
-  --auditfu_log_dir results/resnet18_cifar10_pat_forgetting_tuned
+  --auditfu_log_dir "$LOG_DIR"

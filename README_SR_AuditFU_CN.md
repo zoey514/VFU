@@ -313,6 +313,8 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
 
 ```bash
 PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_srauditfu.py \
+  --data_dir /root/autodl-tmp/VFU_data \
+  --download \
   --dataset cifar10 \
   --model resnet18 \
   --device cuda \
@@ -351,6 +353,12 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
 
 ```bash
 bash system/scripts/run_resnet18_cifar10_pat_forgetting_tuned.sh
+```
+
+脚本默认读取服务器上的 `/root/autodl-tmp/VFU_data`，结果默认写入 `/root/autodl-tmp/VFU_results/resnet18_cifar10_pat_forgetting_tuned`。如果你的服务器路径不同，可以这样覆盖：
+
+```bash
+DATA_DIR=/your/cifar10/path LOG_DIR=/your/result/path bash system/scripts/run_resnet18_cifar10_pat_forgetting_tuned.sh
 ```
 
 这组参数相对上一轮结果做了四个调整：
