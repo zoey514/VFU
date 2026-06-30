@@ -345,7 +345,11 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
   --repair_var_lambda 0.2 \
   --repair_prox_lambda 0.02 \
   --repair_subspace_lambda 1.5 \
-  --retrain_rounds 100 \
+  --task_auc_tolerance 0.05 \
+  --retrain_rounds 200 \
+  --retrain_join_ratio 1.0 \
+  --retrain_encoder_epochs 2 \
+  --retrain_lr_encoder 0.01 \
   --auditfu_log_dir results/resnet18_cifar10_pat_forgetting_tuned
 ```
 
@@ -366,7 +370,8 @@ DATA_DIR=/your/cifar10/path LOG_DIR=/your/result/path bash system/scripts/run_re
 - `auditfu_mcr_strength=1.5` 和 `repair_subspace_lambda=1.5`：增强目标客户端贡献移除和目标子空间约束，优先改善 `TIA-AUC` 与 `Target-CKA`。
 - `repair_strength=0.15`：减小每轮 repair 写回步长，降低 retained 表征被过度扰动的风险。
 - `repair_feat_lambda=1.0`、`repair_var_lambda=0.2`、`repair_prox_lambda=0.02`：增强 retained 表征稳定约束，目标是提升 retained `CKA`。
-- `retrain_rounds=100`：避免 `Retrain` baseline 因训练不足而明显偏低。
+- `task_auc_tolerance=0.05`：将 TIA 判定改为 `abs(TIA-AUC - 0.5) <= 0.05`，避免 AUC 过低时被误判为真正不可区分。
+- `retrain_rounds=200`、`retrain_join_ratio=1.0`、`retrain_encoder_epochs=2`、`retrain_lr_encoder=0.01`：将 `Retrain` 作为更强的 oracle upper-bound baseline，避免因训练不足导致上界偏低。该设置的通信和训练预算高于主方法，不应作为同预算 baseline 解读。
 
 注意：ResNet-18 在 CPU 上会明显更慢，建议有 GPU 时再跑完整配置。
 
@@ -484,6 +489,14 @@ DATA_DIR=/your/cifar10/path LOG_DIR=/your/result/path bash system/scripts/run_re
 - `Dist-to-theta_T`：相对于遗忘前共享模型的参数距离。
 
 这项改动用于避免只按 retained accuracy 排序。比如 `FedOSD-Adapted` 可能拥有更高的 `R-Acc`，但如果 `TIA-AUC`、`Target-CKA` 或 `Target/Retain-CKA` 更差，就不能说明它整体优于 SR-AuditFU-OSD。
+
+在 `threshold_checks` 中，推荐优先看 `task_inf_post_mahalanobis_abs_le_tol`，它使用双侧判据：
+
+```text
+abs(TIA-AUC - 0.5) <= task_auc_tolerance
+```
+
+旧字段 `task_inf_post_mahalanobis_le_0_55` 会保留用于兼容历史结果，但它只检查 AUC 是否小于 0.55，无法区分 `0.50` 和明显低于随机的 `0.34`。
 
 ### baselines
 

@@ -1365,8 +1365,14 @@ def main() -> None:
     parser.add_argument("--baseline_rounds", type=int, default=-1)
     parser.add_argument("--skip_retrain_baseline", action="store_true")
     parser.add_argument("--retrain_rounds", type=int, default=-1)
+    parser.add_argument("--retrain_join_ratio", type=float, default=-1.0)
+    parser.add_argument("--retrain_head_epochs", type=int, default=-1)
+    parser.add_argument("--retrain_encoder_epochs", type=int, default=-1)
+    parser.add_argument("--retrain_lr_head", type=float, default=-1.0)
+    parser.add_argument("--retrain_lr_encoder", type=float, default=-1.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--task_auc_tolerance", type=float, default=0.05)
     parser.add_argument("--auditfu_mask", choices=["full", "topk", "relative"], default="topk")
     parser.add_argument("--auditfu_decay", type=float, default=0.95)
     parser.add_argument("--auditfu_mcr_strength", type=float, default=1.0)
@@ -1713,6 +1719,17 @@ def main() -> None:
         if not args.skip_retrain_baseline:
             retrain_model = FedRepModel(args.embedding_dim, num_classes, args.model, in_channels).to(device)
             retrain_heads = [copy.deepcopy(retrain_model.head.state_dict()) for _ in range(args.num_clients)]
+            retrain_args = copy.copy(args)
+            if args.retrain_head_epochs > 0:
+                retrain_args.head_epochs = args.retrain_head_epochs
+            if args.retrain_encoder_epochs > 0:
+                retrain_args.encoder_epochs = args.retrain_encoder_epochs
+            if args.retrain_lr_head > 0:
+                retrain_args.lr_head = args.retrain_lr_head
+            if args.retrain_lr_encoder > 0:
+                retrain_args.lr_encoder = args.retrain_lr_encoder
+            retrain_join_ratio = args.join_ratio if args.retrain_join_ratio < 0 else args.retrain_join_ratio
+            retrain_join_clients = max(1, int(round(args.num_clients * retrain_join_ratio)))
             retrain_payload = run_training_baseline(
                 "Retrain",
                 retrain_model,
@@ -1722,15 +1739,27 @@ def main() -> None:
                 test_loaders,
                 train_indices,
                 args.target_client,
-                join_clients,
+                retrain_join_clients,
                 retrain_rounds,
-                args,
+                retrain_args,
                 device,
             )
             baseline_artifacts["Retrain"] = (
                 retrain_payload.pop("_model"),
                 retrain_payload.pop("_heads"),
             )
+            retrain_payload["training_config"] = {
+                "oracle_upper_bound": bool(args.retrain_join_ratio >= 0 or args.retrain_rounds >= 0),
+                "rounds": int(retrain_rounds),
+                "join_ratio": float(retrain_join_ratio),
+                "join_clients_requested": int(retrain_join_clients),
+                "join_clients_effective_max": int(min(retrain_join_clients, len(retained_clients))),
+                "head_epochs": int(retrain_args.head_epochs),
+                "encoder_epochs": int(retrain_args.encoder_epochs),
+                "lr_head": float(retrain_args.lr_head),
+                "lr_encoder": float(retrain_args.lr_encoder),
+                "description": "Retrain can be configured as an oracle upper-bound baseline with a larger budget than the main method.",
+            }
             baseline_metrics["Retrain"] = retrain_payload
 
     audit_t0 = time.time()
@@ -1955,6 +1984,10 @@ def main() -> None:
         "retain_score_ge_min": bool(repair_utility_valid),
         "score_valid": bool(score_valid),
         "task_inf_post_mahalanobis_le_0_55": bool(task_post["auc_mahalanobis"] <= 0.55),
+        "task_inf_post_mahalanobis_abs_le_tol": bool(
+            abs(task_post["auc_mahalanobis"] - 0.5) <= args.task_auc_tolerance
+        ),
+        "task_auc_tolerance": float(args.task_auc_tolerance),
         "mia_post_loss_le_0_55": bool(forgetting_metrics["mia_auc_post_loss"] <= 0.55),
         "retain_cka_ge_0_85": bool(forgetting_metrics["retain_cka_pre_to_post_mean"] >= 0.85),
         "target_cka_ratio_le_0_8": bool(forgetting_metrics["target_to_retain_cka_ratio"] <= 0.8),

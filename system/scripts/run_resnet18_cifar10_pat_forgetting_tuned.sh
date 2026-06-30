@@ -39,5 +39,9 @@ PYTHONPATH=${PYTHONPATH:-system} python -u system/experiments/standalone_cifar10
   --repair_subspace_lambda 1.5 \
   --min_pre_retain_acc 0.45 \
   --min_retain_score 0.9 \
-  --retrain_rounds 100 \
+  --task_auc_tolerance 0.05 \
+  --retrain_rounds 200 \
+  --retrain_join_ratio 1.0 \
+  --retrain_encoder_epochs 2 \
+  --retrain_lr_encoder 0.01 \
   --auditfu_log_dir "$LOG_DIR"
