@@ -309,33 +309,56 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
 
 ## ResNet-18 版本
 
-如果希望使用更强的共享编码器，可以选择 ResNet-18：
+如果希望使用更强的共享编码器，可以选择 ResNet-18。根据当前 10 客户端、全量 CIFAR-10、50 轮训练、10 轮 repair 的结果，主方法的 utility 和 audit 已经通过，但 `TIA-AUC`、retained `CKA` 和 target/retain CKA ratio 仍需要加强。因此推荐优先使用下面的 tuned 配置：
 
 ```bash
-PYTHONPATH=system python -B system/experiments/standalone_cifar10_fedrep_srauditfu.py \
+PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_srauditfu.py \
+  --dataset cifar10 \
   --model resnet18 \
-  --device auto \
+  --device cuda \
   --num_clients 10 \
-  --join_ratio 1.0 \
-  --participation_mode normal \
-  --global_rounds 100 \
+  --join_ratio 0.2 \
+  --participation_mode force_target \
+  --target_client 0 \
+  --global_rounds 50 \
   --repair_rounds 10 \
-  --head_epochs 2 \
-  --encoder_epochs 2 \
+  --repair_early_stop_patience 6 \
+  --head_epochs 1 \
+  --encoder_epochs 1 \
+  --batch_size 32 \
   --embedding_dim 128 \
-  --max_train_samples 0 \
-  --max_test_samples 0 \
-  --lr_head 0.05 \
-  --lr_encoder 0.005 \
+  --split_mode pathological \
+  --classes_per_client 2 \
   --auditfu_mask topk \
   --auditfu_topk_ratio 0.2 \
-  --repair_strength 0.2 \
-  --repair_kd_lambda 0.3 \
+  --auditfu_mcr_strength 1.5 \
+  --auditfu_subspace_rank 20 \
+  --osd_lr 0.0004 \
+  --osd_max_batches 1 \
+  --osd_retain_clients 10 \
+  --repair_strength 0.15 \
+  --repair_kd_lambda 0.5 \
   --repair_kd_temp 2.0 \
-  --repair_feat_lambda 0.03 \
-  --repair_var_lambda 0.1 \
-  --repair_early_stop_patience 2
+  --repair_feat_lambda 1.0 \
+  --repair_var_lambda 0.2 \
+  --repair_prox_lambda 0.02 \
+  --repair_subspace_lambda 1.5 \
+  --retrain_rounds 100 \
+  --auditfu_log_dir results/resnet18_cifar10_pat_forgetting_tuned
 ```
+
+也可以直接运行脚本：
+
+```bash
+bash system/scripts/run_resnet18_cifar10_pat_forgetting_tuned.sh
+```
+
+这组参数相对上一轮结果做了四个调整：
+
+- `auditfu_mcr_strength=1.5` 和 `repair_subspace_lambda=1.5`：增强目标客户端贡献移除和目标子空间约束，优先改善 `TIA-AUC` 与 `Target-CKA`。
+- `repair_strength=0.15`：减小每轮 repair 写回步长，降低 retained 表征被过度扰动的风险。
+- `repair_feat_lambda=1.0`、`repair_var_lambda=0.2`、`repair_prox_lambda=0.02`：增强 retained 表征稳定约束，目标是提升 retained `CKA`。
+- `retrain_rounds=100`：避免 `Retrain` baseline 因训练不足而明显偏低。
 
 注意：ResNet-18 在 CPU 上会明显更慢，建议有 GPU 时再跑完整配置。
 
@@ -443,9 +466,20 @@ PYTHONPATH=system python -B system/experiments/standalone_cifar10_fedrep_sraudit
 - `Dist-to-theta_T`：遗忘模型和遗忘前污染模型的相对参数距离，越大表示离原目标影响越远。
 - `AuditPass`：执行审计是否通过，通过为 1，否则为 0。
 
+`report_metrics.baselines` 会对每个 baseline 输出同一组核心对比项：
+
+- `R-Acc`、`ASR`：utility 和目标客户端残留表现。
+- `MIA-AUC`、`TIA-AUC`：遗忘侧攻击指标，越接近 0.5 越好。
+- `CKA`：retained clients 表征保持程度，越高越好。
+- `Target-CKA`：目标客户端遗忘前后表征相似度，越低通常表示目标影响移除更彻底。
+- `Target/Retain-CKA`：目标变化与 retained 稳定性的相对关系，越低越符合“忘 target、保 retained”的目标。
+- `Dist-to-theta_T`：相对于遗忘前共享模型的参数距离。
+
+这项改动用于避免只按 retained accuracy 排序。比如 `FedOSD-Adapted` 可能拥有更高的 `R-Acc`，但如果 `TIA-AUC`、`Target-CKA` 或 `Target/Retain-CKA` 更差，就不能说明它整体优于 SR-AuditFU-OSD。
+
 ### baselines
 
-该分组保存所有启用方法的原始指标、history 和说明。正式表格建议优先读取 `report_metrics.baselines`，需要细节时再查看 `baselines.<method>`。
+该分组保存所有启用方法的原始指标、history、诊断指标和说明。正式表格建议优先读取 `report_metrics.baselines`，需要细节时再查看 `baselines.<method>.diagnostics`。
 
 ### audit_score
 

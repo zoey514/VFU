@@ -1069,6 +1069,8 @@ def run_training_baseline(
         "rounds": int(max(0, rounds)),
         "metrics": evaluate_personalized(baseline_model, baseline_heads, test_loaders, device, target_client),
         "history": history,
+        "_model": baseline_model,
+        "_heads": baseline_heads,
     }
 
 
@@ -1232,6 +1234,57 @@ def concat_embeddings(
     if not chunks:
         return torch.empty(0, model.head.in_features)
     return torch.cat(chunks, dim=0)
+
+
+def evaluate_unlearning_diagnostics(
+    model: FedRepModel,
+    heads: Sequence[Mapping[str, torch.Tensor]],
+    pre_shared_state: Mapping[str, torch.Tensor],
+    pre_target_embeddings: torch.Tensor,
+    pre_retain_client_embeddings: Mapping[int, torch.Tensor],
+    train_loaders: Sequence[DataLoader],
+    test_loaders: Sequence[DataLoader],
+    retained_clients: Sequence[int],
+    target_client: int,
+    device: torch.device,
+    max_batches: int,
+    lambda_white: float,
+) -> Dict[str, object]:
+    """Compute forgetting and representation diagnostics for a method variant."""
+    target_embeddings = collect_embeddings(model, test_loaders[target_client], device, max_batches)
+    retain_embeddings = concat_embeddings(model, test_loaders, device, max_batches, exclude_client=target_client)
+    train_loss, train_conf = collect_losses_and_confidences(
+        model, heads[target_client], train_loaders[target_client], device, max_batches
+    )
+    test_loss, test_conf = collect_losses_and_confidences(
+        model, heads[target_client], test_loaders[target_client], device, max_batches
+    )
+    mia_labels = [1] * len(train_loss) + [0] * len(test_loss)
+    retain_cka_values = []
+    for cid in retained_clients:
+        pre_z = pre_retain_client_embeddings.get(cid, torch.empty(0, model.head.in_features))
+        post_z = collect_embeddings(model, test_loaders[cid], device, max_batches)
+        retain_cka_values.append(linear_cka(pre_z, post_z))
+
+    return {
+        "MIA-AUC": float(binary_auc(mia_labels, [-x for x in train_loss + test_loss])),
+        "MIA-AUC-confidence": float(binary_auc(mia_labels, train_conf + test_conf)),
+        "TIA-AUC": task_inference_auc(
+            target_embeddings,
+            retain_embeddings,
+            pre_target_embeddings,
+            lambda_white,
+        ),
+        "target_CKA_pre_to_post": float(linear_cka(pre_target_embeddings, target_embeddings)),
+        "retain_CKA_pre_to_post_mean": float(np.mean(retain_cka_values)) if retain_cka_values else 0.0,
+        "retain_CKA_pre_to_post_min": float(np.min(retain_cka_values)) if retain_cka_values else 0.0,
+        "target_to_retain_CKA_ratio": float(
+            linear_cka(pre_target_embeddings, target_embeddings) / (np.mean(retain_cka_values) + 1.0e-12)
+        )
+        if retain_cka_values
+        else 0.0,
+        "Dist-to-theta_T": parameter_distance(pre_shared_state, shared_state_dict(model)),
+    }
 
 
 def write_flat_metrics_csv(path: Path, metrics: Mapping[str, object]) -> None:
@@ -1531,6 +1584,11 @@ def main() -> None:
             "description": "MCR + UCE/OSD + recovery-direction projection + target-subspace repair.",
         },
     }
+    baseline_artifacts: Dict[str, Tuple[FedRepModel, Sequence[Mapping[str, torch.Tensor]]]] = {
+        "NoUnlearn": (pre_unlearn_model, pre_unlearn_heads),
+        "MCR-only": (mcr_model, pre_unlearn_heads),
+        "SR-AuditFU-OSD": (global_model, client_heads),
+    }
     if not args.skip_baselines:
         finetune_uce_model = copy.deepcopy(pre_unlearn_model).to(device)
         finetune_uce_heads = copy.deepcopy(pre_unlearn_heads)
@@ -1550,6 +1608,7 @@ def main() -> None:
             "osd": finetune_osd,
             "description": "FedOSD-style UCE target-client update without conflict mitigation or repair.",
         }
+        baseline_artifacts["Fine-tune"] = (finetune_uce_model, finetune_uce_heads)
 
         mcr_repair_model, mcr_repair_heads, mcr_repair_info = run_repair_procedure(
             "MCR+Repair",
@@ -1577,6 +1636,7 @@ def main() -> None:
             "completed_rounds": mcr_repair_info["completed_rounds"],
             "description": "MCR-only followed by KD/feature repair, without FedOSD OSD or target-subspace projection.",
         }
+        baseline_artifacts["MCR+Repair"] = (mcr_repair_model, mcr_repair_heads)
 
         sr_auditfu_model, sr_auditfu_heads, sr_auditfu_info = run_repair_procedure(
             "SR-AuditFU",
@@ -1604,6 +1664,7 @@ def main() -> None:
             "completed_rounds": sr_auditfu_info["completed_rounds"],
             "description": "Original SR-AuditFU: MCR + target-subspace projected retained repair, without UCE/OSD.",
         }
+        baseline_artifacts["SR-AuditFU"] = (sr_auditfu_model, sr_auditfu_heads)
 
         fedosd_model = copy.deepcopy(pre_unlearn_model).to(device)
         fedosd_heads = copy.deepcopy(pre_unlearn_heads)
@@ -1647,11 +1708,12 @@ def main() -> None:
             "osd": fedosd_osd,
             "description": "FedOSD UCE/OSD adapted directly to the shared encoder, without MCR or target-subspace repair.",
         }
+        baseline_artifacts["FedOSD-Adapted"] = (fedosd_model, fedosd_heads)
 
         if not args.skip_retrain_baseline:
             retrain_model = FedRepModel(args.embedding_dim, num_classes, args.model, in_channels).to(device)
             retrain_heads = [copy.deepcopy(retrain_model.head.state_dict()) for _ in range(args.num_clients)]
-            baseline_metrics["Retrain"] = run_training_baseline(
+            retrain_payload = run_training_baseline(
                 "Retrain",
                 retrain_model,
                 retrain_heads,
@@ -1665,6 +1727,11 @@ def main() -> None:
                 args,
                 device,
             )
+            baseline_artifacts["Retrain"] = (
+                retrain_payload.pop("_model"),
+                retrain_payload.pop("_heads"),
+            )
+            baseline_metrics["Retrain"] = retrain_payload
 
     audit_t0 = time.time()
     post_shared_state = shared_state_dict(global_model)
@@ -1681,6 +1748,10 @@ def main() -> None:
     pre_retain_embeddings = concat_embeddings(
         pre_unlearn_model, test_loaders, device, args.max_audit_batches, exclude_client=args.target_client
     )
+    pre_retain_client_embeddings = {
+        cid: collect_embeddings(pre_unlearn_model, test_loaders[cid], device, args.max_audit_batches)
+        for cid in retained_clients
+    }
     post_retain_embeddings = concat_embeddings(
         global_model, test_loaders, device, args.max_audit_batches, exclude_client=args.target_client
     )
@@ -1708,9 +1779,29 @@ def main() -> None:
 
     retain_cka_values = []
     for cid in retained_clients:
-        pre_z = collect_embeddings(pre_unlearn_model, test_loaders[cid], device, args.max_audit_batches)
+        pre_z = pre_retain_client_embeddings[cid]
         post_z = collect_embeddings(global_model, test_loaders[cid], device, args.max_audit_batches)
         retain_cka_values.append(linear_cka(pre_z, post_z))
+
+    baseline_diagnostics = {}
+    for name, (baseline_model, baseline_heads) in baseline_artifacts.items():
+        diagnostics = evaluate_unlearning_diagnostics(
+            baseline_model,
+            baseline_heads,
+            pre_shared_state,
+            pre_target_embeddings,
+            pre_retain_client_embeddings,
+            train_loaders,
+            test_loaders,
+            retained_clients,
+            args.target_client,
+            device,
+            args.max_audit_batches,
+            audit_cfg.audit_lambda_white,
+        )
+        baseline_diagnostics[name] = diagnostics
+        if name in baseline_metrics:
+            baseline_metrics[name]["diagnostics"] = diagnostics
 
     task_pre = task_inference_auc(
         pre_target_embeddings, pre_retain_embeddings, pre_target_embeddings, audit_cfg.audit_lambda_white
@@ -1869,6 +1960,28 @@ def main() -> None:
         "target_cka_ratio_le_0_8": bool(forgetting_metrics["target_to_retain_cka_ratio"] <= 0.8),
         "target_inner_in_retain_95ci": bool(target_ci["within_95ci"]),
     }
+    def compact_method_metrics(payload: Mapping[str, object]) -> Dict[str, float]:
+        metrics = payload.get("metrics", {})
+        diagnostics = payload.get("diagnostics", {})
+        row = {
+            "R-Acc": float(metrics.get("retain_mean_acc", 0.0)) if isinstance(metrics, Mapping) else 0.0,
+            "ASR": float(metrics.get("target_client_acc", 0.0)) if isinstance(metrics, Mapping) else 0.0,
+        }
+        if isinstance(diagnostics, Mapping):
+            tia = diagnostics.get("TIA-AUC", {})
+            dist = diagnostics.get("Dist-to-theta_T", {})
+            row.update(
+                {
+                    "MIA-AUC": float(diagnostics.get("MIA-AUC", 0.5)),
+                    "TIA-AUC": float(tia.get("auc_mahalanobis", 0.5)) if isinstance(tia, Mapping) else 0.5,
+                    "CKA": float(diagnostics.get("retain_CKA_pre_to_post_mean", 0.0)),
+                    "Target-CKA": float(diagnostics.get("target_CKA_pre_to_post", 0.0)),
+                    "Target/Retain-CKA": float(diagnostics.get("target_to_retain_CKA_ratio", 0.0)),
+                    "Dist-to-theta_T": float(dist.get("relative_l2", 0.0)) if isinstance(dist, Mapping) else 0.0,
+                }
+            )
+        return row
+
     report_metrics = {
         "SR-AuditFU-OSD": {
             "R-Acc": float(after_metrics["retain_mean_acc"]),
@@ -1880,10 +1993,7 @@ def main() -> None:
             "AuditPass": float(1.0 if execution_metrics["exec_audit_pass"] else 0.0),
         },
         "baselines": {
-            name: {
-                "R-Acc": float(payload["metrics"].get("retain_mean_acc", 0.0)),
-                "ASR": float(payload["metrics"].get("target_client_acc", 0.0)),
-            }
+            name: compact_method_metrics(payload)
             for name, payload in baseline_metrics.items()
             if isinstance(payload, Mapping) and isinstance(payload.get("metrics"), Mapping)
         },
@@ -1895,6 +2005,7 @@ def main() -> None:
         "execution_audit": execution_metrics,
         "audit_score": audit_score_metrics,
         "report_metrics": report_metrics,
+        "baseline_diagnostics": baseline_diagnostics,
         "baselines": baseline_metrics,
         "system_cost": system_cost_metrics,
         "threshold_checks": threshold_checks,
@@ -1963,6 +2074,10 @@ def main() -> None:
                     name: {
                         "retain_acc": payload["metrics"].get("retain_mean_acc", 0.0),
                         "weighted_acc": payload["metrics"].get("weighted_acc", 0.0),
+                        "mia_auc": payload.get("diagnostics", {}).get("MIA-AUC", 0.0),
+                        "tia_auc": payload.get("diagnostics", {}).get("TIA-AUC", {}).get("auc_mahalanobis", 0.0),
+                        "retain_cka": payload.get("diagnostics", {}).get("retain_CKA_pre_to_post_mean", 0.0),
+                        "target_cka": payload.get("diagnostics", {}).get("target_CKA_pre_to_post", 0.0),
                     }
                     for name, payload in baseline_metrics.items()
                     if isinstance(payload, Mapping) and isinstance(payload.get("metrics"), Mapping)
