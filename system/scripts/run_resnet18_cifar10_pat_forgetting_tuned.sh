@@ -14,9 +14,11 @@ PYTHONPATH=${PYTHONPATH:-system} python -u system/experiments/standalone_cifar10
   --join_ratio 0.2 \
   --participation_mode force_target \
   --target_client 0 \
-  --global_rounds 50 \
-  --repair_rounds 15 \
-  --repair_early_stop_patience 8 \
+  --max_rounds 100 \
+  --global_rounds 100 \
+  --early_stop_patience 5 \
+  --repair_rounds 100 \
+  --repair_early_stop_patience 5 \
   --head_epochs 1 \
   --encoder_epochs 1 \
   --batch_size 32 \
@@ -38,7 +40,7 @@ PYTHONPATH=${PYTHONPATH:-system} python -u system/experiments/standalone_cifar10
   --min_pre_retain_acc 0.45 \
   --min_retain_score 0.9 \
   --task_auc_tolerance 0.05 \
-  --retrain_rounds 200 \
+  --retrain_rounds 100 \
   --retrain_join_ratio 1.0 \
   --retrain_encoder_epochs 2 \
   --retrain_lr_encoder 0.01 \

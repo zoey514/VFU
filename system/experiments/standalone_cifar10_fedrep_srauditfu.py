@@ -307,6 +307,69 @@ def load_model_state_(dst: FedRepModel, src: FedRepModel, device: torch.device) 
     dst.to(device)
 
 
+def clone_state_dict_to_cpu(state: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {name: tensor.detach().cpu().clone() for name, tensor in state.items()}
+
+
+def checkpoint_dir(args: argparse.Namespace) -> Path:
+    return Path(args.checkpoint_dir) if args.checkpoint_dir else Path(args.auditfu_log_dir) / "checkpoints"
+
+
+def checkpoint_path(args: argparse.Namespace, filename: str) -> Path:
+    return checkpoint_dir(args) / filename
+
+
+def safe_filename(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in name)
+
+
+def save_experiment_checkpoint(
+    path: Path,
+    stage: str,
+    model: FedRepModel,
+    heads: Sequence[Mapping[str, torch.Tensor]],
+    metrics: Mapping[str, object],
+    round_id: int,
+    args: argparse.Namespace,
+    extra: Mapping[str, object] | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "stage": stage,
+            "round": int(round_id),
+            "metrics": dict(metrics),
+            "model_config": {
+                "embedding_dim": int(model.embedding_dim),
+                "num_classes": int(model.num_classes),
+                "model_name": str(model.model_name),
+                "in_channels": int(model.in_channels),
+            },
+            "model_state": clone_state_dict_to_cpu(model.state_dict()),
+            "client_heads": [clone_state_dict_to_cpu(head) for head in heads],
+            "args": vars(args),
+            "extra": dict(extra or {}),
+        },
+        path,
+    )
+
+
+def load_experiment_checkpoint(
+    path: str,
+    model: FedRepModel,
+    device: torch.device,
+) -> Tuple[List[Mapping[str, torch.Tensor]] | None, Mapping[str, object]]:
+    payload = torch.load(path, map_location="cpu")
+    model.load_state_dict(payload["model_state"])
+    model.to(device)
+    heads = payload.get("client_heads")
+    return heads, payload
+
+
+def early_stop_score(metrics: Mapping[str, float]) -> float:
+    return float(metrics.get("retain_mean_acc", metrics.get("weighted_acc", 0.0)))
+
+
 def coral_loss(current: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
     if current.shape[0] < 2 or teacher.shape[0] < 2:
         return current.new_tensor(0.0)
@@ -925,6 +988,23 @@ def run_repair_procedure(
     stale_rounds = 0
     history = []
     completed_rounds = 0
+    best_checkpoint = checkpoint_path(args, f"repair_{safe_filename(label)}_best.pt")
+    if args.save_checkpoints:
+        save_experiment_checkpoint(
+            best_checkpoint,
+            f"{label}_repair",
+            best_model,
+            best_heads,
+            best_metrics,
+            best_round,
+            args,
+            {
+                "reason": "initial_repair_model",
+                "label": label,
+                "used_projection": bool(use_projection),
+                "used_teacher": bool(use_teacher),
+            },
+        )
 
     total_repair_rounds = args.repair_rounds if repair_rounds is None else int(repair_rounds)
     for repair_id in range(max(0, total_repair_rounds)):
@@ -961,7 +1041,8 @@ def run_repair_procedure(
         update_bytes = 0
         if audit_logger is not None:
             for cid, weight, update in zip(selected, weights, client_updates):
-                record = audit_logger.log_client_update(args.global_rounds + repair_id, cid, weight, update)
+                train_round_offset = int(getattr(args, "completed_global_rounds", args.global_rounds))
+                record = audit_logger.log_client_update(train_round_offset + repair_id, cid, weight, update)
                 hashes.append(record.update_hash)
                 update_bytes += tensor_dict_bytes(update)
         else:
@@ -1008,12 +1089,28 @@ def run_repair_procedure(
             f"time={elapsed:.1f}s"
         )
 
-        if metrics["retain_mean_acc"] > best_metrics["retain_mean_acc"] + args.repair_min_delta:
+        if early_stop_score(metrics) > early_stop_score(best_metrics) + args.early_stop_min_delta:
             best_metrics = metrics
             best_model = copy.deepcopy(model).to(device)
             best_heads = copy.deepcopy(heads)
             best_round = repair_id + 1
             stale_rounds = 0
+            if args.save_checkpoints:
+                save_experiment_checkpoint(
+                    best_checkpoint,
+                    f"{label}_repair",
+                    best_model,
+                    best_heads,
+                    best_metrics,
+                    best_round,
+                    args,
+                    {
+                        "reason": "best_repair_accuracy",
+                        "label": label,
+                        "used_projection": bool(use_projection),
+                        "used_teacher": bool(use_teacher),
+                    },
+                )
         else:
             stale_rounds += 1
         if args.repair_early_stop_patience >= 0 and stale_rounds >= args.repair_early_stop_patience:
@@ -1028,6 +1125,7 @@ def run_repair_procedure(
         "best_metrics": best_metrics,
         "final_metrics": final_metrics,
         "restored_best_checkpoint": True,
+        "checkpoint": str(best_checkpoint) if args.save_checkpoints else "",
         "used_projection": bool(use_projection),
         "used_teacher": bool(use_teacher),
     }
@@ -1049,8 +1147,28 @@ def run_training_baseline(
 ) -> Dict[str, object]:
     baseline_model = copy.deepcopy(model).to(device)
     baseline_heads = copy.deepcopy(list(heads))
+    best_model = copy.deepcopy(baseline_model).to(device)
+    best_heads = copy.deepcopy(baseline_heads)
+    best_metrics = evaluate_personalized(best_model, best_heads, test_loaders, device, target_client)
+    best_score = -float("inf")
+    best_round = 0
+    stale_rounds = 0
+    completed_rounds = 0
+    best_checkpoint = checkpoint_path(args, f"{safe_filename(label)}_best.pt")
+    if args.save_checkpoints:
+        save_experiment_checkpoint(
+            best_checkpoint,
+            label,
+            best_model,
+            best_heads,
+            best_metrics,
+            best_round,
+            args,
+            {"reason": "initial_baseline_model", "label": label},
+        )
     history = []
     for round_id in range(max(0, rounds)):
+        t0 = time.time()
         selected = deterministic_select_clients(
             allowed_clients,
             min(join_clients, len(allowed_clients)),
@@ -1068,6 +1186,8 @@ def run_training_baseline(
         )
         apply_shared_update_(baseline_model, aggregate)
         metrics = evaluate_personalized(baseline_model, baseline_heads, test_loaders, device, target_client)
+        elapsed = time.time() - t0
+        completed_rounds += 1
         history.append(
             {
                 "round": round_id + 1,
@@ -1075,14 +1195,51 @@ def run_training_baseline(
                 "loss": float(np.mean(losses)) if losses else 0.0,
                 "retain_mean_acc": float(metrics.get("retain_mean_acc", 0.0)),
                 "weighted_acc": float(metrics["weighted_acc"]),
+                "time_seconds": float(elapsed),
             }
         )
+        best_display = "n/a" if not math.isfinite(best_score) else f"{best_score:.4f}"
+        print(
+            f"{label} round {round_id + 1:03d}/{rounds}: "
+            f"loss={np.mean(losses):.4f}, weighted_acc={metrics['weighted_acc']:.4f}, "
+            f"retain_acc={metrics.get('retain_mean_acc', 0.0):.4f}, best_retain={best_display}, "
+            f"time={elapsed:.1f}s"
+        )
+        score = early_stop_score(metrics)
+        if score > best_score + args.early_stop_min_delta:
+            best_score = score
+            best_metrics = metrics
+            best_model = copy.deepcopy(baseline_model).to(device)
+            best_heads = copy.deepcopy(baseline_heads)
+            best_round = round_id + 1
+            stale_rounds = 0
+            if args.save_checkpoints:
+                save_experiment_checkpoint(
+                    best_checkpoint,
+                    label,
+                    best_model,
+                    best_heads,
+                    best_metrics,
+                    best_round,
+                    args,
+                    {"reason": "best_baseline_accuracy", "label": label},
+                )
+        else:
+            stale_rounds += 1
+        if args.early_stop_patience >= 0 and stale_rounds >= args.early_stop_patience:
+            print(f"{label} early stopped at round {round_id + 1}; restoring best round {best_round}.")
+            break
     return {
         "rounds": int(max(0, rounds)),
-        "metrics": evaluate_personalized(baseline_model, baseline_heads, test_loaders, device, target_client),
+        "completed_rounds": int(completed_rounds),
+        "best_round": int(best_round),
+        "metrics": best_metrics,
+        "final_metrics": evaluate_personalized(baseline_model, baseline_heads, test_loaders, device, target_client),
         "history": history,
-        "_model": baseline_model,
-        "_heads": baseline_heads,
+        "restored_best_checkpoint": True,
+        "checkpoint": str(best_checkpoint) if args.save_checkpoints else "",
+        "_model": best_model,
+        "_heads": best_heads,
     }
 
 
@@ -1329,9 +1486,9 @@ def main() -> None:
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--num_clients", type=int, default=100)
     parser.add_argument("--join_ratio", type=float, default=0.1)
-    parser.add_argument("--global_rounds", type=int, default=50)
+    parser.add_argument("--global_rounds", type=int, default=100)
     parser.add_argument("--total_rounds", type=int, default=100)
-    parser.add_argument("--repair_rounds", type=int, default=20)
+    parser.add_argument("--repair_rounds", type=int, default=100)
     parser.add_argument("--model", choices=["small_cnn", "resnet18"], default="small_cnn")
     parser.add_argument("--head_epochs", type=int, default=1)
     parser.add_argument("--encoder_epochs", type=int, default=1)
@@ -1369,7 +1526,10 @@ def main() -> None:
     parser.add_argument("--repair_subspace_lambda", type=float, default=1.0)
     parser.add_argument("--repair_coral_lambda", type=float, default=None)
     parser.add_argument("--repair_strength", type=float, default=0.2)
-    parser.add_argument("--repair_early_stop_patience", type=int, default=2)
+    parser.add_argument("--early_stop_patience", type=int, default=5)
+    parser.add_argument("--early_stop_min_delta", type=float, default=1.0e-4)
+    parser.add_argument("--max_rounds", type=int, default=100)
+    parser.add_argument("--repair_early_stop_patience", type=int, default=5)
     parser.add_argument("--repair_min_delta", type=float, default=1.0e-4)
     parser.add_argument("--min_pre_retain_acc", type=float, default=0.45)
     parser.add_argument("--min_retain_score", type=float, default=0.9)
@@ -1383,6 +1543,10 @@ def main() -> None:
     parser.add_argument("--retrain_encoder_epochs", type=int, default=-1)
     parser.add_argument("--retrain_lr_head", type=float, default=-1.0)
     parser.add_argument("--retrain_lr_encoder", type=float, default=-1.0)
+    parser.add_argument("--init_checkpoint", default="")
+    parser.add_argument("--checkpoint_dir", default="")
+    parser.add_argument("--save_checkpoints", dest="save_checkpoints", action="store_true", default=True)
+    parser.add_argument("--no_save_checkpoints", dest="save_checkpoints", action="store_false")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--task_auc_tolerance", type=float, default=0.05)
@@ -1400,6 +1564,13 @@ def main() -> None:
         args.participation_mode = "force_target"
     if args.repair_coral_lambda is not None:
         args.repair_var_lambda = args.repair_coral_lambda
+    args.max_rounds = max(1, int(args.max_rounds))
+    args.global_rounds = min(max(0, int(args.global_rounds)), args.max_rounds)
+    args.repair_rounds = min(max(0, int(args.repair_rounds)), args.max_rounds)
+    if args.baseline_rounds >= 0:
+        args.baseline_rounds = min(int(args.baseline_rounds), args.max_rounds)
+    if args.retrain_rounds >= 0:
+        args.retrain_rounds = min(int(args.retrain_rounds), args.max_rounds)
     args.force_target_participation = args.participation_mode in {"force_target", "balanced_force_target"}
     args.auditfu_lambda_kd = args.repair_kd_lambda
     args.auditfu_kd_tau = args.repair_kd_temp
@@ -1449,6 +1620,20 @@ def main() -> None:
 
     global_model = FedRepModel(args.embedding_dim, num_classes, args.model, in_channels).to(device)
     client_heads = [copy.deepcopy(global_model.head.state_dict()) for _ in range(args.num_clients)]
+    init_checkpoint_info = None
+    if args.init_checkpoint:
+        loaded_heads, init_checkpoint_info = load_experiment_checkpoint(args.init_checkpoint, global_model, device)
+        if loaded_heads is not None and len(loaded_heads) == args.num_clients:
+            client_heads = [clone_state_dict_to_cpu(head) for head in loaded_heads]
+        elif loaded_heads is not None:
+            print(
+                f"Init checkpoint loaded model state but ignored {len(loaded_heads)} heads "
+                f"because num_clients={args.num_clients}."
+            )
+        print(
+            f"Loaded init checkpoint from {args.init_checkpoint}: "
+            f"stage={init_checkpoint_info.get('stage')}, round={init_checkpoint_info.get('round')}"
+        )
     audit_cfg = SRAuditConfig.from_args(args, target_client=args.target_client)
     audit_logger = AuditLogger(audit_cfg)
     join_clients = max(1, int(round(args.num_clients * args.join_ratio)))
@@ -1461,6 +1646,23 @@ def main() -> None:
         f"NC={args.classes_per_client}, target_client={args.target_client}"
     )
     print("Shared part: model.base / personalized part: model.head")
+
+    best_train_metrics = evaluate_personalized(global_model, client_heads, test_loaders, device, args.target_client)
+    best_train_score = -float("inf")
+    best_train_round = 0
+    train_stale_rounds = 0
+    completed_global_rounds = 0
+    if args.save_checkpoints:
+        save_experiment_checkpoint(
+            checkpoint_path(args, "train_best.pt"),
+            "train",
+            global_model,
+            client_heads,
+            best_train_metrics,
+            best_train_round,
+            args,
+            {"reason": "initial_model"},
+        )
 
     for round_id in range(args.global_rounds):
         t0 = time.time()
@@ -1511,11 +1713,40 @@ def main() -> None:
         audit_logger.log_round(round_id, selected, state_before, state_after, hashes)
         phase_times["train_rounds"].append(time.time() - t0)
         metrics = evaluate_personalized(global_model, client_heads, test_loaders, device, args.target_client)
+        completed_global_rounds += 1
+        best_train_display = "n/a" if not math.isfinite(best_train_score) else f"{best_train_score:.4f}"
         print(
             f"Round {round_id + 1:03d}/{args.global_rounds}: "
             f"loss={np.mean(losses):.4f}, weighted_acc={metrics['weighted_acc']:.4f}, "
-            f"retain_acc={metrics['retain_mean_acc']:.4f}, time={phase_times['train_rounds'][-1]:.1f}s"
+            f"retain_acc={metrics['retain_mean_acc']:.4f}, best_retain={best_train_display}, "
+            f"time={phase_times['train_rounds'][-1]:.1f}s"
         )
+        score = early_stop_score(metrics)
+        if score > best_train_score + args.early_stop_min_delta:
+            best_train_score = score
+            best_train_metrics = metrics
+            best_train_round = round_id + 1
+            train_stale_rounds = 0
+            if args.save_checkpoints:
+                save_experiment_checkpoint(
+                    checkpoint_path(args, "train_best.pt"),
+                    "train",
+                    global_model,
+                    client_heads,
+                    best_train_metrics,
+                    best_train_round,
+                    args,
+                    {"reason": "best_retain_accuracy"},
+                )
+        else:
+            train_stale_rounds += 1
+        if args.early_stop_patience >= 0 and train_stale_rounds >= args.early_stop_patience:
+            print(
+                f"Training early stopped at round {round_id + 1}; "
+                f"best round {best_train_round}, best_retain={best_train_score:.4f}."
+            )
+            break
+    args.completed_global_rounds = completed_global_rounds
 
     pre_unlearn_model = copy.deepcopy(global_model).to(device)
     pre_unlearn_heads = copy.deepcopy(client_heads)
@@ -1599,6 +1830,7 @@ def main() -> None:
             "history": full_repair_info["history"],
             "best_round": full_repair_info["best_round"],
             "completed_rounds": full_repair_info["completed_rounds"],
+            "checkpoint": full_repair_info.get("checkpoint", ""),
             "osd": osd_metrics,
             "description": "Core method: auditable logging + sparse MCR + retained-client KD/feature/prox repair.",
         },
@@ -1654,6 +1886,7 @@ def main() -> None:
                 "history": mcr_repair_info["history"],
                 "best_round": mcr_repair_info["best_round"],
                 "completed_rounds": mcr_repair_info["completed_rounds"],
+                "checkpoint": mcr_repair_info.get("checkpoint", ""),
                 "description": "Redundant ablation: MCR-only followed by the same KD/feature/prox repair used by SR-AuditFU-Core.",
             }
             baseline_artifacts["MCR+Repair"] = (mcr_repair_model, mcr_repair_heads)
@@ -1682,6 +1915,7 @@ def main() -> None:
             "history": sr_auditfu_info["history"],
             "best_round": sr_auditfu_info["best_round"],
             "completed_rounds": sr_auditfu_info["completed_rounds"],
+            "checkpoint": sr_auditfu_info.get("checkpoint", ""),
             "description": "Original SR-AuditFU: MCR + target-subspace projected retained repair, without UCE/OSD.",
         }
         baseline_artifacts["SR-AuditFU"] = (sr_auditfu_model, sr_auditfu_heads)
@@ -1725,6 +1959,7 @@ def main() -> None:
             "history": fedosd_info["history"],
             "best_round": fedosd_info["best_round"],
             "completed_rounds": fedosd_info["completed_rounds"],
+            "checkpoint": fedosd_info.get("checkpoint", ""),
             "osd": fedosd_osd,
             "description": "FedOSD UCE/OSD adapted directly to the shared encoder, without MCR or target-subspace repair.",
         }
@@ -2045,6 +2280,20 @@ def main() -> None:
             if isinstance(payload, Mapping) and isinstance(payload.get("metrics"), Mapping)
         },
     }
+    checkpoint_metrics = {
+        "enabled": bool(args.save_checkpoints),
+        "checkpoint_dir": str(checkpoint_dir(args)) if args.save_checkpoints else "",
+        "init_checkpoint": str(args.init_checkpoint),
+        "train_best": str(checkpoint_path(args, "train_best.pt")) if args.save_checkpoints else "",
+        "train_best_round": int(best_train_round),
+        "train_completed_rounds": int(completed_global_rounds),
+        "repair_best": str(full_repair_info.get("checkpoint", "")),
+        "baseline_best": {
+            name: str(payload.get("checkpoint", ""))
+            for name, payload in baseline_metrics.items()
+            if isinstance(payload, Mapping) and payload.get("checkpoint")
+        },
+    }
     all_metrics = {
         "utility": utility_metrics,
         "forgetting": forgetting_metrics,
@@ -2055,6 +2304,7 @@ def main() -> None:
         "baseline_diagnostics": baseline_diagnostics,
         "baselines": baseline_metrics,
         "system_cost": system_cost_metrics,
+        "checkpoints": checkpoint_metrics,
         "threshold_checks": threshold_checks,
         "metadata": {
             "dataset": args.dataset,
@@ -2069,6 +2319,7 @@ def main() -> None:
             "participation_mode": args.participation_mode,
             "is_stress_test": bool(args.participation_mode != "normal"),
             "basis_rank": 0 if target_basis is None else int(target_basis.shape[1]),
+            "checkpoint_dir": checkpoint_metrics["checkpoint_dir"],
             "args": vars(args),
         },
     }
@@ -2090,6 +2341,7 @@ def main() -> None:
             "threshold_checks": threshold_checks,
             "audit_score": audit_score_metrics,
             "report_metrics": report_metrics,
+            "checkpoints": checkpoint_metrics,
             "baseline_names": list(baseline_metrics.keys()),
             "participation_mode": args.participation_mode,
             "is_stress_test": bool(args.participation_mode != "normal"),

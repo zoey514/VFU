@@ -305,9 +305,11 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
   --join_ratio 0.2 \
   --participation_mode force_target \
   --target_client 0 \
-  --global_rounds 50 \
-  --repair_rounds 15 \
-  --repair_early_stop_patience 8 \
+  --max_rounds 100 \
+  --global_rounds 100 \
+  --early_stop_patience 5 \
+  --repair_rounds 100 \
+  --repair_early_stop_patience 5 \
   --head_epochs 1 \
   --encoder_epochs 1 \
   --batch_size 32 \
@@ -327,7 +329,7 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
   --repair_prox_lambda 0.05 \
   --repair_subspace_lambda 0.0 \
   --task_auc_tolerance 0.05 \
-  --retrain_rounds 200 \
+  --retrain_rounds 100 \
   --retrain_join_ratio 1.0 \
   --retrain_encoder_epochs 2 \
   --retrain_lr_encoder 0.01 \
@@ -350,17 +352,39 @@ DATA_DIR=/your/cifar10/path LOG_DIR=/your/result/path bash system/scripts/run_re
 
 - `--disable_osd` 和 `repair_subspace_lambda=0.0`：默认主链路只保留三核心模块，OSD 和 target-subspace projection 放入 ablation。
 - `auditfu_mcr_strength=1.2`：避免过强 MCR 同时破坏 retained 表征。
-- `repair_rounds=15`、`repair_early_stop_patience=8`：给 retained repair 更充分恢复空间。
+- `max_rounds=100`、`early_stop_patience=5`、`repair_early_stop_patience=5`：所有循环阶段最多 100 轮；准确率连续 5 轮没有提升就早停。
 - `repair_strength=0.12`、`repair_feat_lambda=1.5`、`repair_prox_lambda=0.05`：降低单轮写回幅度并增强 retained 表征稳定。
 - `repair_var_lambda=0.0`：默认移除 variance/CORAL 项，降低 repair 正则冗余。
 - `task_auc_tolerance=0.05`：将 TIA 判定改为 `abs(TIA-AUC - 0.5) <= 0.05`，避免 AUC 过低时被误判为真正不可区分。
-- `retrain_rounds=200`、`retrain_join_ratio=1.0`、`retrain_encoder_epochs=2`、`retrain_lr_encoder=0.01`：将 `Retrain` 作为更强的 oracle upper-bound baseline，避免因训练不足导致上界偏低。该设置的通信和训练预算高于主方法，不应作为同预算 baseline 解读。
+- `retrain_rounds=100`、`retrain_join_ratio=1.0`、`retrain_encoder_epochs=2`、`retrain_lr_encoder=0.01`：将 `Retrain` 作为更强的 oracle upper-bound baseline，避免因训练不足导致上界偏低。该设置的通信和训练预算高于主方法，不应作为同预算 baseline 解读。
+
+训练、repair 和 retrain 都会保存最佳 checkpoint，默认位于：
+
+```text
+<auditfu_log_dir>/checkpoints/
+```
+
+常用文件包括：
+
+```text
+train_best.pt
+repair_SR-AuditFU-Core_best.pt
+Retrain_best.pt
+```
+
+下一次可以从某个最佳模型继续：
+
+```bash
+PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_srauditfu.py \
+  --init_checkpoint /root/autodl-tmp/VFU_results/resnet18_cifar10_pat_core/checkpoints/train_best.pt \
+  ...
+```
 
 注意：ResNet-18 在 CPU 上会明显更慢，建议有 GPU 时再跑完整配置。
 
 ## 输出文件说明
 
-每次 standalone 运行会在 `--auditfu_log_dir` 下写出三个文件。
+每次 standalone 运行会在 `--auditfu_log_dir` 下写出指标文件，并在 `checkpoints/` 中保存最佳模型参数。
 
 ### evidence.json
 
