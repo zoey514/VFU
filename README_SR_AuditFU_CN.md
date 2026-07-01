@@ -96,7 +96,7 @@ repair_update_projected = repair_update - B (B^T repair_update)
 
 `system/flcore/unlearning/zk_mcr.py` 提供 ZK-ready proof specification 和 deterministic prototype verifier。
 
-它的证明关系只覆盖 MCR 算术正确性：
+当前 prototype mode 可以检查 MCR output consistency、mask consistency，并在有 target records/config/template 时检查 contribution consistency；但它仍不是真实零知识证明。其关系写成：
 
 ```text
 target_contribution = sum_t aggregation_weight_t * decay^(T-t) * delta_theta_u_t
@@ -105,10 +105,18 @@ theta_after_mcr = theta_before_unlearn - mcr_strength * masked_contribution
 hash(theta_after_mcr) == public output commitment
 ```
 
+prototype mode 支持：
+
+- Level 1：MCR output consistency，检查 `theta_after_mcr == theta_before_unlearn - mcr_strength * masked_contribution`。
+- Level 2：mask consistency，检查 `masked_contribution == mask * target_contribution`。
+- Level 3：time-decayed contribution consistency。如果 target records/config/template 可用，检查 `target_contribution` 是否等于目标客户端日志记录的 time-decayed 聚合。
+
 当前默认实现不是 production zkSNARK。除非接入真实外部 ZK backend，否则它只是 prototype verifier 和 proof metadata 生成器。
 
 ZK-MCR 明确不证明：
 
+- top-k / relative mask generation correctness；
+- Merkle inclusion of target updates；
 - local training correctness；
 - full federated aggregation correctness；
 - retained-client repair correctness；
@@ -259,10 +267,27 @@ PYTHONPATH=system python -B system/experiments/standalone_cifar10_fedrep_sraudit
 "zk_mcr": {
   "enabled": true,
   "mode": "prototype",
-  "proved_relation": "MCR execution correctness only",
+  "verification_scope": "prototype_level_1_2_3",
+  "proved_relation": "MCR execution correctness prototype",
   "proves_training": false,
   "proves_repair": false,
-  "proves_mcr": true
+  "proves_mcr_output_consistency": true,
+  "proves_mask_consistency": true,
+  "proves_contribution_consistency": true,
+  "proves_mask_generation_correctness": false,
+  "proves_merkle_inclusion": false,
+  "production_zksnark": false,
+  "verification": {
+    "verified": true,
+    "levels": {
+      "output_consistency": {"available": true, "verified": true},
+      "mask_consistency": {"available": true, "verified": true},
+      "contribution_consistency": {"available": true, "verified": true},
+      "mask_generation_correctness": {"available": false, "verified": null},
+      "merkle_inclusion": {"available": false, "verified": null},
+      "production_zksnark": {"available": false, "verified": null}
+    }
+  }
 }
 ```
 
@@ -271,7 +296,12 @@ PYTHONPATH=system python -B system/experiments/standalone_cifar10_fedrep_sraudit
 ```json
 "zk_mcr": {
   "enabled": false,
-  "reason": "ZK-MCR is an optional enhancement; the default audit layer is hash-chain/Merkle evidence."
+  "reason": "ZK-MCR is optional; default audit layer is hash-chain/Merkle evidence.",
+  "proves_mcr_output_consistency": false,
+  "proves_mask_consistency": false,
+  "proves_contribution_consistency": false,
+  "proves_training": false,
+  "proves_repair": false
 }
 ```
 
@@ -299,7 +329,9 @@ bash system/scripts/run_resnet18_cifar10_pat_forgetting_tuned.sh
 当前实现需要按以下边界解释：
 
 - 默认审计是 hash-chain / Merkle evidence，不是零知识证明。
-- ZK-MCR 是可选增强，只证明 MCR arithmetic correctness。
+- ZK-MCR 是可选增强；prototype mode 只检查 MCR output consistency、mask consistency，并在有 target records 时检查 contribution consistency。
+- ZK-MCR 不证明 top-k / relative mask generation correctness。
+- ZK-MCR 不证明 Merkle inclusion of target updates。
 - ZK-MCR 不证明 local training correctness。
 - ZK-MCR 不证明 full federated aggregation correctness。
 - ZK-MCR 不证明 retained-client repair correctness。
