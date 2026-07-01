@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/root/autodl-tmp/VFU_data}"
-LOG_DIR="${LOG_DIR:-/root/autodl-tmp/VFU_results/resnet18_cifar10_pat_core}"
+LOG_DIR="${LOG_DIR:-/root/autodl-tmp/VFU_results/resnet18_cifar10_pat_srauditfu}"
 
 PYTHONPATH=${PYTHONPATH:-system} python -u system/experiments/standalone_cifar10_fedrep_srauditfu.py \
   --data_dir "$DATA_DIR" \
@@ -30,6 +30,7 @@ PYTHONPATH=${PYTHONPATH:-system} python -u system/experiments/standalone_cifar10
   --auditfu_topk_ratio 0.2 \
   --auditfu_mcr_strength 1.0 \
   --auditfu_subspace_rank 20 \
+  --enable_target_subspace_projection \
   --disable_osd \
   --repair_strength 0.10 \
   --repair_kd_lambda 0.5 \

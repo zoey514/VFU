@@ -43,6 +43,8 @@ def parse_args():
     parser.add_argument("--auditfu_kd_tau", type=float, default=2.0)
     parser.add_argument("--auditfu_direction_basis_path", default="")
     parser.add_argument("--auditfu_log_dir", default="results/sr_auditfu")
+    parser.add_argument("--enable_target_subspace_projection", dest="enable_target_subspace_projection", action="store_true", default=True)
+    parser.add_argument("--disable_target_subspace_projection", dest="enable_target_subspace_projection", action="store_false")
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args()
 
@@ -110,6 +112,10 @@ def main():
         "--auditfu_log_dir",
         args.auditfu_log_dir,
     ]
+    if args.enable_target_subspace_projection:
+        cmd.append("--enable_target_subspace_projection")
+    else:
+        cmd.append("--disable_target_subspace_projection")
     if args.auditfu_direction_basis_path:
         cmd.extend(["--auditfu_direction_basis_path", args.auditfu_direction_basis_path])
     print(" ".join(cmd))

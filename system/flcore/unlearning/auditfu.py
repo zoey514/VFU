@@ -7,8 +7,13 @@ state_dict-style tensors.  SR-AuditFU follows the report design:
 1. log every shared encoder update with hash-chain metadata;
 2. locate the leaving client's historical contribution with time decay;
 3. apply full, top-k, or relative masks for MCR;
-4. build a target contribution subspace and project repair gradients;
+4. build a target contribution subspace and project retained-client repair
+   updates onto its orthogonal complement;
 5. export an auditable evidence package and black-box representation scores.
+
+Hash-chain, Merkle roots and deterministic scheduling are a lightweight audit
+layer. They are not zero-knowledge proofs by themselves. Optional ZK-MCR
+metadata, when enabled by a runner, only covers MCR arithmetic correctness.
 """
 
 from __future__ import annotations

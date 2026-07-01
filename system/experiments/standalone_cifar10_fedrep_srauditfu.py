@@ -7,11 +7,15 @@ running the method in the current workspace:
 * each client owns a private linear classification head;
 * data are split with a Dirichlet label-skew partition;
 * client updates are logged and then target-client unlearning is performed by
-  MCR + target-subspace server projection repair.
+  sparse MCR + target-subspace orthogonal retained repair.
 
 The implementation is intentionally compact but keeps the same decomposition as
 the report: shared representation is the unlearning object, local heads remain
 personalized and are never aggregated.
+
+The default method is SR-AuditFU: auditable logging + sparse MCR +
+target-subspace orthogonal retained repair. SR-AuditFU-Core is kept as a
+no-projection ablation.
 """
 
 from __future__ import annotations
@@ -55,6 +59,7 @@ from flcore.unlearning.auditfu import (
     unlearning_cross_entropy,
     unflatten_vector,
 )
+from flcore.unlearning.zk_mcr import ZKMCRPrototypeVerifier, disabled_zk_mcr_metadata
 
 
 class ConvEncoder(nn.Module):
@@ -1418,6 +1423,92 @@ def concat_embeddings(
     return torch.cat(chunks, dim=0)
 
 
+@torch.no_grad()
+def evaluate_retrain_consistency(
+    method_model: FedRepModel,
+    method_heads: Sequence[Mapping[str, torch.Tensor]],
+    retrain_model: FedRepModel | None,
+    retrain_heads: Sequence[Mapping[str, torch.Tensor]] | None,
+    loaders: Sequence[DataLoader],
+    retained_clients: Sequence[int],
+    device: torch.device,
+    max_batches: int,
+) -> Dict[str, object]:
+    """Compare the main method with the Retrain oracle on retained clients."""
+
+    if retrain_model is None or retrain_heads is None:
+        return {
+            "available": False,
+            "reason": "not_available",
+            "Agreement-to-Retrain": None,
+            "KL-to-Retrain": None,
+            "CKA-to-Retrain": None,
+            "ParamDist-to-Retrain": None,
+            "retrain_consistency_score": None,
+        }
+
+    method_eval = copy.deepcopy(method_model).to(device)
+    retrain_eval = copy.deepcopy(retrain_model).to(device)
+    method_eval.eval()
+    retrain_eval.eval()
+    agree = 0
+    seen = 0
+    kl_sum = 0.0
+    method_embeddings = []
+    retrain_embeddings = []
+
+    for cid in retained_clients:
+        method_eval.head.load_state_dict(method_heads[cid])
+        retrain_eval.head.load_state_dict(retrain_heads[cid])
+        for batch_id, (x, _) in enumerate(loaders[cid]):
+            if batch_id >= max_batches:
+                break
+            x = x.to(device)
+            method_z = method_eval.base(x)
+            retrain_z = retrain_eval.base(x)
+            method_logits = method_eval.head(method_z)
+            retrain_logits = retrain_eval.head(retrain_z)
+            method_pred = method_logits.argmax(dim=1)
+            retrain_pred = retrain_logits.argmax(dim=1)
+            batch_size = int(x.shape[0])
+            agree += int((method_pred == retrain_pred).sum().item())
+            seen += batch_size
+            kl = F.kl_div(
+                F.log_softmax(method_logits, dim=1),
+                F.softmax(retrain_logits, dim=1),
+                reduction="batchmean",
+            )
+            kl_sum += float(kl.item()) * batch_size
+            method_embeddings.append(method_z.detach().cpu())
+            retrain_embeddings.append(retrain_z.detach().cpu())
+
+    if seen == 0:
+        return {
+            "available": False,
+            "reason": "no_retained_samples",
+            "Agreement-to-Retrain": None,
+            "KL-to-Retrain": None,
+            "CKA-to-Retrain": None,
+            "ParamDist-to-Retrain": None,
+            "retrain_consistency_score": None,
+        }
+
+    cka = linear_cka(torch.cat(method_embeddings, dim=0), torch.cat(retrain_embeddings, dim=0))
+    dist = parameter_distance(shared_state_dict(method_eval), shared_state_dict(retrain_eval))
+    agreement = agree / max(1, seen)
+    kl_value = kl_sum / max(1, seen)
+    kl_score = 1.0 / (1.0 + max(0.0, kl_value))
+    consistency_score = float(0.4 * agreement + 0.3 * kl_score + 0.3 * cka)
+    return {
+        "available": True,
+        "Agreement-to-Retrain": float(agreement),
+        "KL-to-Retrain": float(kl_value),
+        "CKA-to-Retrain": float(cka),
+        "ParamDist-to-Retrain": dist,
+        "retrain_consistency_score": consistency_score,
+    }
+
+
 def evaluate_unlearning_diagnostics(
     model: FedRepModel,
     heads: Sequence[Mapping[str, torch.Tensor]],
@@ -1538,6 +1629,19 @@ def main() -> None:
     parser.add_argument("--repair_var_lambda", type=float, default=0.1)
     parser.add_argument("--repair_prox_lambda", type=float, default=0.01)
     parser.add_argument("--repair_subspace_lambda", type=float, default=1.0)
+    parser.add_argument(
+        "--enable_target_subspace_projection",
+        dest="enable_target_subspace_projection",
+        action="store_true",
+        default=True,
+        help="Enable server-side projection of retained repair updates onto the target-subspace orthogonal complement.",
+    )
+    parser.add_argument(
+        "--disable_target_subspace_projection",
+        dest="enable_target_subspace_projection",
+        action="store_false",
+        help="Disable target-subspace projection; this makes the main path equivalent to SR-AuditFU-Core.",
+    )
     parser.add_argument("--repair_coral_lambda", type=float, default=None)
     parser.add_argument("--repair_strength", type=float, default=0.2)
     parser.add_argument("--early_stop_patience", type=int, default=5)
@@ -1572,6 +1676,9 @@ def main() -> None:
     parser.add_argument("--auditfu_subspace_rank", type=int, default=20)
     parser.add_argument("--auditfu_lr_log_rank", type=int, default=256)
     parser.add_argument("--auditfu_log_dir", default="results/standalone_cifar10_fedrep_srauditfu")
+    parser.add_argument("--enable_zk_mcr", action="store_true", default=False)
+    parser.add_argument("--zk_mcr_mode", choices=["prototype"], default="prototype")
+    parser.add_argument("--zk_mcr_quant_scale", type=int, default=1_000_000)
     parser.add_argument("--trace_progress", action="store_true", help="Print fine-grained phase markers for server debugging.")
     args = parser.parse_args()
     if args.force_target_participation and args.participation_mode == "normal":
@@ -1656,7 +1763,7 @@ def main() -> None:
     communication = {"train_upload_bytes": 0, "train_download_bytes": 0, "repair_upload_bytes": 0, "repair_download_bytes": 0}
 
     print(
-        f"SR-AuditFU-Core setup: dataset={args.dataset}, split={args.split_mode}, "
+        f"SR-AuditFU setup: dataset={args.dataset}, split={args.split_mode}, "
         f"clients={args.num_clients}, join_clients={join_clients}, alpha={args.alpha}, "
         f"NC={args.classes_per_client}, target_client={args.target_client}"
     )
@@ -1789,6 +1896,42 @@ def main() -> None:
     phase_times["mcr_seconds"] = time.time() - mcr_t0
     mcr_model = copy.deepcopy(global_model).to(device)
     mcr_shared_state = shared_state_dict(mcr_model)
+    zk_mcr_metadata: Dict[str, object] = disabled_zk_mcr_metadata()
+    if args.enable_zk_mcr:
+        zk_t0 = time.time()
+        verifier = ZKMCRPrototypeVerifier(args.zk_mcr_quant_scale)
+        proof = verifier.prove(
+            pre_shared_state,
+            target_contribution,
+            mask,
+            masked_contribution,
+            mcr_shared_state,
+            audit_cfg.mcr_strength,
+        )
+        verification = verifier.verify(
+            proof,
+            pre_shared_state,
+            masked_contribution,
+            mcr_shared_state,
+            audit_cfg.mcr_strength,
+        )
+        zk_mcr_metadata = {
+            "enabled": True,
+            "mode": args.zk_mcr_mode,
+            "proved_relation": proof.proved_relation,
+            "proves_training": False,
+            "proves_repair": False,
+            "proves_mcr": True,
+            "input_commitments": proof.input_commitments,
+            "output_commitment": proof.output_commitment,
+            "quantization": proof.quantization,
+            "proof_hash": proof.proof_hash,
+            "proof_time_seconds": float(proof.proof_time_seconds),
+            "verification_time_seconds": float(verification["verification_time_seconds"]),
+            "proof_size_bytes": int(proof.proof_size_bytes),
+            "verification": verification,
+            "wall_time_seconds": float(time.time() - zk_t0),
+        }
     mcr_metrics = evaluate_personalized(mcr_model, pre_unlearn_heads, test_loaders, device, args.target_client)
     retained_clients = [cid for cid in range(args.num_clients) if cid != args.target_client]
     osd_metrics = {"used_osd": False, "target_grad_norm": 0.0, "osd_direction_norm": 0.0, "retained_gradient_count": 0}
@@ -1809,14 +1952,16 @@ def main() -> None:
     osd_model = copy.deepcopy(global_model).to(device)
     osd_shared_state = shared_state_dict(osd_model)
     osd_metrics["metrics"] = evaluate_personalized(osd_model, pre_unlearn_heads, test_loaders, device, args.target_client)
+    main_method_name = "SR-AuditFU" if args.enable_target_subspace_projection else "SR-AuditFU-Core"
     print(
         f"Unlearn target client {args.target_client}: records={len(target_records)}, "
         f"basis_rank={0 if target_basis is None else target_basis.shape[1]}, "
-        f"mask={audit_cfg.mask}, osd={args.enable_osd}, core_modules=True"
+        f"mask={audit_cfg.mask}, osd={args.enable_osd}, "
+        f"target_projection={args.enable_target_subspace_projection}, method={main_method_name}"
     )
 
     global_model, client_heads, full_repair_info = run_repair_procedure(
-        "SR-AuditFU-Core",
+        main_method_name,
         global_model,
         client_heads,
         pre_unlearn_model,
@@ -1826,11 +1971,11 @@ def main() -> None:
         train_indices,
         retained_clients,
         args.target_client,
-        None,
+        target_basis if args.enable_target_subspace_projection else None,
         join_clients,
         args,
         device,
-        use_projection=False,
+        use_projection=bool(args.enable_target_subspace_projection),
         use_teacher=True,
         audit_logger=audit_logger,
         phase_times=phase_times,
@@ -1840,6 +1985,8 @@ def main() -> None:
 
     baseline_rounds = args.repair_rounds if args.baseline_rounds < 0 else args.baseline_rounds
     retrain_rounds = args.global_rounds if args.retrain_rounds < 0 else args.retrain_rounds
+    retrain_artifact_model: FedRepModel | None = None
+    retrain_artifact_heads: Sequence[Mapping[str, torch.Tensor]] | None = None
     baseline_metrics: Dict[str, object] = {
         "NoUnlearn": {
             "metrics": pre_metrics,
@@ -1849,22 +1996,59 @@ def main() -> None:
             "metrics": mcr_metrics,
             "description": "Apply masked contribution removal without retained-client repair.",
         },
-        "SR-AuditFU-Core": {
+        main_method_name: {
             "metrics": full_repair_info["best_metrics"],
             "history": full_repair_info["history"],
             "best_round": full_repair_info["best_round"],
             "completed_rounds": full_repair_info["completed_rounds"],
             "checkpoint": full_repair_info.get("checkpoint", ""),
             "osd": osd_metrics,
-            "description": "Core method: auditable logging + sparse MCR + retained-client KD/feature/prox repair.",
+            "description": (
+                "Main method: auditable logging + sparse MCR + target-subspace orthogonal "
+                "retained-client KD/feature/prox repair."
+                if args.enable_target_subspace_projection
+                else "No-projection main path equivalent to SR-AuditFU-Core."
+            ),
+            "used_target_subspace_projection": bool(args.enable_target_subspace_projection),
         },
     }
     baseline_artifacts: Dict[str, Tuple[FedRepModel, Sequence[Mapping[str, torch.Tensor]]]] = {
         "NoUnlearn": (pre_unlearn_model, pre_unlearn_heads),
         "MCR-only": (mcr_model, pre_unlearn_heads),
-        "SR-AuditFU-Core": (global_model, client_heads),
+        main_method_name: (global_model, client_heads),
     }
     if not args.skip_baselines:
+        if args.enable_target_subspace_projection:
+            core_model, core_heads, core_info = run_repair_procedure(
+                "SR-AuditFU-Core",
+                mcr_model,
+                pre_unlearn_heads,
+                pre_unlearn_model,
+                pre_unlearn_heads,
+                train_loaders,
+                test_loaders,
+                train_indices,
+                retained_clients,
+                args.target_client,
+                None,
+                join_clients,
+                args,
+                device,
+                use_projection=False,
+                use_teacher=True,
+                repair_rounds=baseline_rounds,
+            )
+            baseline_metrics["SR-AuditFU-Core"] = {
+                "metrics": core_info["best_metrics"],
+                "history": core_info["history"],
+                "best_round": core_info["best_round"],
+                "completed_rounds": core_info["completed_rounds"],
+                "checkpoint": core_info.get("checkpoint", ""),
+                "description": "Ablation: auditable logging + sparse MCR + retained-client KD/feature/prox repair, without target-subspace projection.",
+                "used_target_subspace_projection": False,
+            }
+            baseline_artifacts["SR-AuditFU-Core"] = (core_model, core_heads)
+
         finetune_uce_model = copy.deepcopy(pre_unlearn_model).to(device)
         finetune_uce_heads = copy.deepcopy(pre_unlearn_heads)
         finetune_update, finetune_osd = osd_unlearning_update(
@@ -1911,38 +2095,9 @@ def main() -> None:
                 "best_round": mcr_repair_info["best_round"],
                 "completed_rounds": mcr_repair_info["completed_rounds"],
                 "checkpoint": mcr_repair_info.get("checkpoint", ""),
-                "description": "Redundant ablation: MCR-only followed by the same KD/feature/prox repair used by SR-AuditFU-Core.",
+                "description": "Redundant ablation: MCR-only followed by KD/feature/prox repair, without target-subspace projection.",
             }
             baseline_artifacts["MCR+Repair"] = (mcr_repair_model, mcr_repair_heads)
-
-        sr_auditfu_model, sr_auditfu_heads, sr_auditfu_info = run_repair_procedure(
-            "SR-AuditFU",
-            mcr_model,
-            pre_unlearn_heads,
-            pre_unlearn_model,
-            pre_unlearn_heads,
-            train_loaders,
-            test_loaders,
-            train_indices,
-            retained_clients,
-            args.target_client,
-            target_basis,
-            join_clients,
-            args,
-            device,
-            use_projection=True,
-            use_teacher=True,
-            repair_rounds=baseline_rounds,
-        )
-        baseline_metrics["SR-AuditFU"] = {
-            "metrics": sr_auditfu_info["best_metrics"],
-            "history": sr_auditfu_info["history"],
-            "best_round": sr_auditfu_info["best_round"],
-            "completed_rounds": sr_auditfu_info["completed_rounds"],
-            "checkpoint": sr_auditfu_info.get("checkpoint", ""),
-            "description": "Original SR-AuditFU: MCR + target-subspace projected retained repair, without UCE/OSD.",
-        }
-        baseline_artifacts["SR-AuditFU"] = (sr_auditfu_model, sr_auditfu_heads)
 
         fedosd_model = copy.deepcopy(pre_unlearn_model).to(device)
         fedosd_heads = copy.deepcopy(pre_unlearn_heads)
@@ -2021,6 +2176,7 @@ def main() -> None:
                 retrain_payload.pop("_model"),
                 retrain_payload.pop("_heads"),
             )
+            retrain_artifact_model, retrain_artifact_heads = baseline_artifacts["Retrain"]
             retrain_payload["training_config"] = {
                 "oracle_upper_bound": bool(args.retrain_join_ratio >= 0 or args.retrain_rounds >= 0),
                 "rounds": int(retrain_rounds),
@@ -2105,6 +2261,24 @@ def main() -> None:
         if name in baseline_metrics:
             baseline_metrics[name]["diagnostics"] = diagnostics
 
+    if retrain_artifact_model is None or retrain_artifact_heads is None:
+        retrain_pair = baseline_artifacts.get("Retrain")
+        if retrain_pair is not None:
+            retrain_artifact_model, retrain_artifact_heads = retrain_pair
+    retrain_consistency_metrics = evaluate_retrain_consistency(
+        global_model,
+        client_heads,
+        retrain_artifact_model,
+        retrain_artifact_heads,
+        test_loaders,
+        retained_clients,
+        device,
+        args.max_audit_batches,
+    )
+    baseline_diagnostics["SR-AuditFU_vs_Retrain"] = retrain_consistency_metrics
+    if main_method_name in baseline_metrics:
+        baseline_metrics[main_method_name]["retrain_consistency"] = retrain_consistency_metrics
+
     task_pre = task_inference_auc(
         pre_target_embeddings, pre_retain_embeddings, pre_target_embeddings, audit_cfg.audit_lambda_white
     )
@@ -2188,10 +2362,21 @@ def main() -> None:
         1.0,
         after_metrics["retain_mean_acc"] / (before_metrics["retain_mean_acc"] + 1.0e-12),
     )
+    retrain_consistency_score = retrain_consistency_metrics.get("retrain_consistency_score")
+    if retrain_consistency_metrics.get("available") and retrain_consistency_score is not None:
+        forgetting_summary_score = (
+            0.25 * fs_tia
+            + 0.25 * fs_mia
+            + 0.20 * fs_cka
+            + 0.15 * max(0.0, min(1.0, forgetting_metrics["retain_cka_pre_to_post_mean"]))
+            + 0.15 * float(retrain_consistency_score)
+        )
+    else:
+        forgetting_summary_score = 0.4 * fs_tia + 0.3 * fs_mia + 0.3 * fs_cka
     raw_score_sr_auditfu = float(
         (1.0 if execution_metrics["exec_audit_pass"] else 0.0)
         * retain_score
-        * (0.4 * fs_tia + 0.3 * fs_mia + 0.3 * fs_cka)
+        * forgetting_summary_score
     )
     pre_utility_valid = bool(before_metrics["retain_mean_acc"] >= args.min_pre_retain_acc)
     repair_utility_valid = bool(retain_score >= args.min_retain_score)
@@ -2219,6 +2404,13 @@ def main() -> None:
         "forgetting_score_tia": float(fs_tia),
         "forgetting_score_mia": float(fs_mia),
         "forgetting_score_cka": float(fs_cka),
+        "forgetting_summary_score": float(forgetting_summary_score),
+        "retrain_consistency_score": (
+            float(retrain_consistency_score)
+            if retrain_consistency_metrics.get("available") and retrain_consistency_score is not None
+            else None
+        ),
+        "summary_score_note": "audit_score is a compact summary only and must not replace per-metric reporting.",
         "raw_score_sr_auditfu": float(raw_score_sr_auditfu),
         "score_sr_auditfu": float(raw_score_sr_auditfu if score_valid else 0.0),
     }
@@ -2266,12 +2458,14 @@ def main() -> None:
         "target_cka_ratio_le_0_8": bool(forgetting_metrics["target_to_retain_cka_ratio"] <= 0.8),
         "target_inner_in_retain_95ci": bool(target_ci["within_95ci"]),
     }
-    def compact_method_metrics(payload: Mapping[str, object]) -> Dict[str, float]:
+    def compact_method_metrics(payload: Mapping[str, object]) -> Dict[str, object]:
         metrics = payload.get("metrics", {})
         diagnostics = payload.get("diagnostics", {})
+        target_acc = float(metrics.get("target_client_acc", 0.0)) if isinstance(metrics, Mapping) else 0.0
         row = {
             "R-Acc": float(metrics.get("retain_mean_acc", 0.0)) if isinstance(metrics, Mapping) else 0.0,
-            "ASR": float(metrics.get("target_client_acc", 0.0)) if isinstance(metrics, Mapping) else 0.0,
+            "Target-Acc": target_acc,
+            "ASR_deprecated_alias_of_Target_Acc": target_acc,
         }
         if isinstance(diagnostics, Mapping):
             tia = diagnostics.get("TIA-AUC", {})
@@ -2286,16 +2480,42 @@ def main() -> None:
                     "Dist-to-theta_T": float(dist.get("relative_l2", 0.0)) if isinstance(dist, Mapping) else 0.0,
                 }
             )
+        consistency = payload.get("retrain_consistency", {})
+        if isinstance(consistency, Mapping):
+            row.update(
+                {
+                    "Agreement-to-Retrain": consistency.get("Agreement-to-Retrain"),
+                    "KL-to-Retrain": consistency.get("KL-to-Retrain"),
+                    "CKA-to-Retrain": consistency.get("CKA-to-Retrain"),
+                    "ParamDist-to-Retrain": (
+                        consistency.get("ParamDist-to-Retrain", {}).get("relative_l2")
+                        if isinstance(consistency.get("ParamDist-to-Retrain"), Mapping)
+                        else None
+                    ),
+                }
+            )
         return row
 
+    main_target_acc = float(after_metrics.get("target_client_acc", 0.0))
     report_metrics = {
-        "SR-AuditFU-Core": {
+        main_method_name: {
             "R-Acc": float(after_metrics["retain_mean_acc"]),
-            "ASR": float(after_metrics.get("target_client_acc", 0.0)),
+            "Target-Acc": main_target_acc,
+            "ASR_deprecated_alias_of_Target_Acc": main_target_acc,
             "MIA-AUC": float(forgetting_metrics["mia_auc_post_loss"]),
             "TIA-AUC": float(task_post["auc_mahalanobis"]),
             "CKA": float(forgetting_metrics["retain_cka_pre_to_post_mean"]),
+            "Target-CKA": float(forgetting_metrics["target_cka_pre_to_post"]),
+            "Target/Retain-CKA": float(forgetting_metrics["target_to_retain_cka_ratio"]),
             "Dist-to-theta_T": float(forgetting_metrics["param_distance_pre_to_post"]["relative_l2"]),
+            "Agreement-to-Retrain": retrain_consistency_metrics.get("Agreement-to-Retrain"),
+            "KL-to-Retrain": retrain_consistency_metrics.get("KL-to-Retrain"),
+            "CKA-to-Retrain": retrain_consistency_metrics.get("CKA-to-Retrain"),
+            "ParamDist-to-Retrain": (
+                retrain_consistency_metrics.get("ParamDist-to-Retrain", {}).get("relative_l2")
+                if isinstance(retrain_consistency_metrics.get("ParamDist-to-Retrain"), Mapping)
+                else None
+            ),
             "AuditPass": float(1.0 if execution_metrics["exec_audit_pass"] else 0.0),
         },
         "baselines": {
@@ -2323,9 +2543,11 @@ def main() -> None:
         "forgetting": forgetting_metrics,
         "representation": representation_metrics,
         "execution_audit": execution_metrics,
+        "zk_mcr": zk_mcr_metadata,
         "audit_score": audit_score_metrics,
         "report_metrics": report_metrics,
         "baseline_diagnostics": baseline_diagnostics,
+        "retrain_consistency": retrain_consistency_metrics,
         "baselines": baseline_metrics,
         "system_cost": system_cost_metrics,
         "checkpoints": checkpoint_metrics,
@@ -2334,11 +2556,13 @@ def main() -> None:
             "dataset": args.dataset,
             "split_mode": args.split_mode,
             "classes_per_client": args.classes_per_client,
-            "algorithm": "FedRep+SRAuditFU-Core",
+            "algorithm": "FedRep+SR-AuditFU",
+            "main_method": main_method_name,
             "model": args.model,
             "target_client": args.target_client,
             "retain_clients": retained_clients,
             "target_record_count": len(target_records),
+            "target_subspace_projection_enabled": bool(args.enable_target_subspace_projection),
             "force_target_participation": bool(args.force_target_participation),
             "participation_mode": args.participation_mode,
             "is_stress_test": bool(args.participation_mode != "normal"),
@@ -2356,15 +2580,18 @@ def main() -> None:
             "standalone_runner": True,
             "dataset": args.dataset,
             "split_mode": args.split_mode,
-            "algorithm": "FedRep+SRAuditFU-Core",
+            "algorithm": "FedRep+SR-AuditFU",
+            "main_method": main_method_name,
             "target_client": args.target_client,
             "target_record_count": len(target_records),
             "basis_rank": 0 if target_basis is None else int(target_basis.shape[1]),
+            "target_subspace_projection_enabled": bool(args.enable_target_subspace_projection),
             "metrics_file": "metrics.json",
             "flat_metrics_file": "metrics_flat.csv",
             "threshold_checks": threshold_checks,
             "audit_score": audit_score_metrics,
             "report_metrics": report_metrics,
+            "zk_mcr": zk_mcr_metadata,
             "checkpoints": checkpoint_metrics,
             "baseline_names": list(baseline_metrics.keys()),
             "participation_mode": args.participation_mode,
@@ -2392,7 +2619,9 @@ def main() -> None:
                     "retain_cka_pre_to_post_mean": forgetting_metrics["retain_cka_pre_to_post_mean"],
                 },
                 "execution_audit": execution_metrics,
+                "zk_mcr": zk_mcr_metadata,
                 "audit_score": audit_score_metrics,
+                "retrain_consistency": retrain_consistency_metrics,
                 "baselines": {
                     name: {
                         "retain_acc": payload["metrics"].get("retain_mean_acc", 0.0),

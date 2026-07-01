@@ -27,6 +27,7 @@ for lr_head in 0.05 0.1; do
       --auditfu_topk_ratio 0.2 \
       --auditfu_subspace_rank 4 \
       --auditfu_lr_log_rank 256 \
+      --enable_target_subspace_projection \
       --repair_kd_lambda 1.0 \
       --repair_kd_temp 2.0 \
       --repair_feat_lambda 0.1 \

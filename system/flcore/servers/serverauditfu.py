@@ -7,8 +7,13 @@ FedRep/FedPer-style clients and adds:
 * per-round shared encoder update logging with hash-chain records;
 * MCR contribution removal for a target client;
 * SVD target subspace construction;
-* server-side projection during retained-client repair;
+* server-side target-subspace orthogonal projection during retained-client repair;
 * auditable evidence export.
+
+This PFLlib path follows the same main method as the standalone runner:
+SR-AuditFU = auditable logging + sparse MCR + target-subspace orthogonal
+retained repair. The projection can be disabled for the SR-AuditFU-Core
+ablation with ``--disable_target_subspace_projection``.
 """
 
 from __future__ import annotations
@@ -61,6 +66,7 @@ class SRAuditFU(_BaseFedRep):
         self.direction_basis: Optional[torch.Tensor] = self._load_direction_basis()
         self.repair_rounds = int(getattr(args, "auditfu_repair_rounds", max(1, getattr(args, "global_rounds", 10) // 10)))
         self.target_client = int(getattr(args, "target_client", self.auditfu_config.target_client))
+        self.enable_target_subspace_projection = bool(getattr(args, "enable_target_subspace_projection", True))
 
         if hasattr(self, "set_slow_clients"):
             self.set_slow_clients()
@@ -106,6 +112,8 @@ class SRAuditFU(_BaseFedRep):
         return aggregate
 
     def _apply_server_projection(self, aggregate_update: Mapping[str, torch.Tensor]):
+        if not self.enable_target_subspace_projection:
+            return aggregate_update
         if self.target_basis is None or self.shared_template is None:
             return aggregate_update
         names = sorted(self.shared_template.keys())
@@ -225,6 +233,7 @@ class SRAuditFU(_BaseFedRep):
                 "target_round_count": len(target_records),
                 "mask": self.auditfu_config.mask,
                 "subspace_rank": 0 if self.target_basis is None else int(self.target_basis.shape[1]),
+                "target_subspace_projection_enabled": bool(self.enable_target_subspace_projection),
                 "repair_rounds": self.repair_rounds,
             },
         )

@@ -1,182 +1,194 @@
 # SR-AuditFU 中文说明
 
-本项目实现的是面向共享表征式个性化联邦学习的可审计客户端遗忘方法。根据 ResNet-18 全量 CIFAR-10 结果，当前主方法已简化为 **SR-AuditFU-Core**：保留可审计更新日志、top-k 稀疏目标贡献移除和 retained-client 表征修复三个核心模块。FedOSD 的 UCE/OSD、target-subspace projection 和 recovery 方向投影保留为 baseline 或 ablation，不再作为默认主链路。
+## 1. 方法定位
 
-项目当前同时提供两条运行路径：
-
-- standalone 路径：`system/experiments/standalone_cifar10_fedrep_srauditfu.py`，不依赖完整 PFLlib，适合在当前仓库直接跑 CIFAR-10 实验和 smoke test。
-- PFLlib 路径：`system/flcore/servers/serverauditfu.py` 与 `system/flcore/clients/clientauditfu.py`，用于接入 PFLlib 的 server/client 框架。
-
-## 方法概览
-
-SR-AuditFU-Core 的完整流程围绕三个核心模块展开。共享表征训练和最终评估是实验流程的一部分，但不作为方法创新模块包装。
-
-### 核心模块一：Auditable Contribution Logging
-
-每个客户端模型由共享编码器和本地头组成：
+SR-AuditFU 是一个面向共享表征式个性化联邦学习的轻量可审计联邦遗忘框架。当前论文主线不是默认的零知识证明系统，而是：
 
 ```text
-f_i(x) = h_i(phi(x))
+SR-AuditFU = Auditable Contribution Logging
+           + Sparse Target Contribution Removal
+           + Target-Subspace Orthogonal Repair
+           + retained-client KD / feature / prox repair
 ```
 
-其中 `phi` 是共享编码器，代码中对应 `model.base`；`h_i` 是第 `i` 个客户端的本地头，代码中对应 `model.head`。训练采用 FedRep 风格：先固定共享编码器训练本地头，再固定本地头训练共享编码器。服务器只聚合共享编码器的参数更新。
+其中默认主方法是 `SR-AuditFU`。它在目标客户端贡献移除后，继续在 retained clients 上修复 utility，并把 repair update 投影到目标贡献子空间的正交补空间，降低 repair 阶段重新恢复目标客户端影响的风险。
 
-每轮训练会记录共享编码器更新、参与客户端、聚合前后模型哈希、更新 Merkle root、VRF-style seed 和 hash-chain。这样后续遗忘不是只给一个结果模型，而是能给出可复查的执行证据。
+`SR-AuditFU-Core` 保留为 no-projection ablation：它有可审计日志、稀疏 MCR 和 retained-client repair，但没有 target-subspace orthogonal projection。
 
-### 核心模块二：Sparse Target Contribution Removal
+本项目默认审计层由 hash-chain、Merkle root、deterministic scheduler 和 `evidence.json` 组成。这是轻量执行审计证据，不等同于零知识证明。ZK-MCR 只是可选增强模块，用于证明 MCR 算术执行关系，不证明完整训练或完整 repair。
 
-当目标客户端 `target_client` 请求遗忘时，系统从日志中找出它参与过的所有轮次，按时间衰减累计它对共享编码器的贡献：
+## 2. 适用场景
+
+SR-AuditFU 适用于共享表征式个性化联邦学习，例如 FedRep、FedPer 或类似“共享 encoder + 个性化 head”的设置。
+
+- 服务器聚合共享表征参数，例如 `model.base`、`encoder`、`backbone`。
+- 客户端保留本地个性化 head，例如 `model.head`、`classifier`。
+- 遗忘对象是目标客户端对共享表征的历史贡献。
+- retained clients 的目标是尽量保留 utility 和表征结构。
+
+当前 standalone 实验入口是：
 
 ```text
-C_u = sum_t decay^(T-t) * aggregation_weight_t * delta_theta_u_t
+system/experiments/standalone_cifar10_fedrep_srauditfu.py
 ```
 
-随后对贡献向量做 mask。目前支持三种 mask：
-
-- `full`：移除全部目标贡献。
-- `topk`：只移除绝对值最大的 top-k 坐标，当前默认配置。
-- `relative`：只移除目标贡献在总贡献中占比足够高的坐标。
-
-### 核心模块三：Retained-Client Representation Repair
-
-MCR 会降低 retained clients 的 utility，因此主方法在 retained clients 上执行轻量 repair。当前 core repair 默认使用：
-
-- CE：保持 retained clients 的分类能力。
-- KD：让 repair 后模型贴近遗忘前教师模型的 logits。
-- feature mean stability：降低 retained 表征漂移。
-- prox：约束共享编码器不要过度偏离遗忘前模型。
-
-`variance/CORAL`、target-subspace projection、UCE/OSD 和 recovery-direction projection 均作为可选增强或 ablation，不再默认进入 core 主方法。
-
-MCR 阶段执行：
+PFLlib 接入路径包括：
 
 ```text
+system/flcore/unlearning/auditfu.py
+system/flcore/servers/serverauditfu.py
+system/flcore/clients/clientauditfu.py
+```
+
+## 3. 核心模块
+
+### 3.1 Auditable Contribution Logging
+
+该模块记录每轮共享表征更新，并生成可复核证据：
+
+- `ClientUpdateRecord`：记录客户端 id、聚合权重、共享更新 hash、可选低秩日志。
+- `AuditRoundRecord`：记录训练轮次、选中客户端、模型状态 hash、Merkle root、VRF-style seed、hash-chain。
+- `AuditRepairRecord`：记录 repair 轮次，并把 `target_basis_hash` 绑定到 repair 证据中。
+- deterministic scheduler：用公开 seed 和 hash 排序复现客户端选择。
+- `evidence.json`：导出训练记录、repair 记录、客户端更新 metadata 和实验 extra 信息。
+
+注意：hash-chain 和 Merkle root 只能证明导出的证据包内部一致，不能自动等价于第三方公证或零知识证明。如果服务器没有把链头提交给第三方或可信时间戳系统，它仍可能事后伪造一整套自洽日志。
+
+### 3.2 Sparse Target Contribution Removal
+
+Sparse Target Contribution Removal 使用目标客户端历史共享表征更新估计其贡献：
+
+```text
+target_contribution = sum_t aggregation_weight_t * decay^(T-t) * delta_theta_u_t
+```
+
+然后生成 mask：
+
+- `full`：移除全部估计贡献。
+- `topk`：按贡献绝对值保留 top-k 坐标，默认适合控制遗忘扰动范围。
+- `relative`：按目标贡献相对总贡献的 dominance 选择坐标。
+
+最后执行 masked contribution removal：
+
+```text
+masked_contribution = mask * target_contribution
 theta_after_mcr = theta_before_unlearn - mcr_strength * masked_contribution
 ```
 
-standalone 路径中的 core repair 损失为：
+### 3.3 Target-Subspace Orthogonal Repair
+
+MCR 可能降低 retained clients 的 utility，因此 SR-AuditFU 会在 retained clients 上执行 repair。默认 repair 包括：
+
+- CE：保留 retained clients 的分类能力。
+- KD：让修复后模型贴近遗忘前教师模型 logits。
+- feature mean / variance stability：稳定 retained 表征分布。
+- prox：限制 repair 后参数偏离过大。
+
+SR-AuditFU 的关键点是：repair update 聚合后，服务器会把它投影到目标贡献子空间的正交补空间：
 
 ```text
-CE(retain labels)
-+ lambda_kd * KL(pre logits || current logits)
-+ lambda_feat * embedding mean alignment
-+ lambda_prox * ||phi - phi_pre||^2
+repair_update_projected = repair_update - B (B^T repair_update)
 ```
 
-遗忘后系统会输出多个维度指标：
+其中 `B` 是由目标客户端历史贡献构造的 target subspace。这样做的动机是：普通 retained-client fine-tune 虽然能恢复 utility，但可能沿目标客户端历史贡献方向“回弹”，重新恢复应被遗忘的影响。Target-subspace orthogonal repair 是默认主方法的一部分，不再只是 baseline。
 
-- retained utility：保留客户端准确率、macro-F1、新客户端头适配表现。
-- forgetting：task-inference AUC、MIA AUC、target CKA、参数距离、mask 稀疏度。
-- representation：坐标方差、成对内积、Mahalanobis 分数、目标是否落入 retained 分布区间。
-- execution audit：hash-chain、Merkle root、VRF seed、repair 记录是否可验证。
-- system cost：训练、repair、MCR、audit 时间，以及通信和存储估计。
-- report_metrics：按研究报告命名输出 `R-Acc`、`ASR`、`MIA-AUC`、`TIA-AUC`、`CKA`、`Dist-to-theta_T`、`AuditPass`。
-- audit_score：保留综合 gate 分数，用于判定实验是否可解释。
+### 3.4 Optional ZK-MCR Enhancement
 
-## 目录和文件职责
+`system/flcore/unlearning/zk_mcr.py` 提供 ZK-ready proof specification 和 deterministic prototype verifier。
 
-### 核心算法
+它的证明关系只覆盖 MCR 算术正确性：
 
-`system/flcore/unlearning/auditfu.py`
+```text
+target_contribution = sum_t aggregation_weight_t * decay^(T-t) * delta_theta_u_t
+masked_contribution = mask * target_contribution
+theta_after_mcr = theta_before_unlearn - mcr_strength * masked_contribution
+hash(theta_after_mcr) == public output commitment
+```
 
-负责 SR-AuditFU 的核心工具函数和数据结构：
+当前默认实现不是 production zkSNARK。除非接入真实外部 ZK backend，否则它只是 prototype verifier 和 proof metadata 生成器。
 
-- 区分共享编码器参数和本地头参数。
-- 展平和恢复 tensor dict。
-- 计算 shared update、模型哈希、tensor 哈希。
-- 记录训练轮次 `AuditRoundRecord`。
-- 记录 repair 轮次 `AuditRepairRecord`。
-- 维护 hash-chain 和 Merkle root。
-- 保存低秩日志 LR-Log。
-- 计算目标客户端历史贡献。
-- 生成 `full`、`topk`、`relative` mask。
-- 执行 MCR。
-- 计算 FedOSD UCE 损失。
-- 计算 OSD 正交最速下降方向。
-- 执行 recovery 阶段方向投影。
-- 从 masked target deltas 构造目标贡献子空间。
-- 将 repair update 投影到目标子空间的正交补空间。
-- 计算表征审计分数。
+ZK-MCR 明确不证明：
 
-### PFLlib Server
+- local training correctness；
+- full federated aggregation correctness；
+- retained-client repair correctness；
+- 完整联邦训练过程；
+- 完整遗忘流程。
 
-`system/flcore/servers/serverauditfu.py`
+## 4. 方法变体和 Baselines
 
-负责 PFLlib 版本的服务端流程：
+| 方法 | 类型 | 默认运行 | 说明 |
+| --- | --- | --- | --- |
+| `NoUnlearn` | baseline | 是 | 不做遗忘，保留污染模型。 |
+| `MCR-only` | baseline | 是 | 只执行 sparse target contribution removal，不做 repair。 |
+| `SR-AuditFU` | 主方法 | 是 | auditable logging + sparse MCR + target-subspace orthogonal repair + KD/feature/prox repair。 |
+| `SR-AuditFU-Core` | ablation | 非 skip baseline 时运行 | 无 projection 的轻量消融：auditable logging + sparse MCR + KD/feature/prox repair。 |
+| `Fine-tune` | baseline | 非 skip baseline 时运行 | FedOSD-style UCE-only target update，不做 OSD 和 retained repair。 |
+| `FedOSD-Adapted` | 外部 baseline | 非 skip baseline 时运行 | 将 FedOSD 的 UCE/OSD 思路适配到共享 encoder。 |
+| `Retrain` | oracle baseline | 未设置 `--skip_retrain_baseline` 时运行 | 去掉目标客户端后从头训练或按设定预算训练，用作 oracle 参考。 |
+| `MCR+Repair` | redundant ablation | 默认不运行 | 与 `SR-AuditFU-Core` 路径高度重叠，仅在 `--include_redundant_baselines` 时运行。 |
 
-- 正常联邦训练。
-- 每轮记录共享编码器更新。
-- 收到遗忘请求后定位目标客户端历史记录。
-- 执行 MCR。
-- 构造 masked target subspace。
-- 在 retained clients 上执行 repair。
-- 聚合并投影 repair update。
-- 导出 evidence JSON。
+如果显式加入：
 
-### PFLlib Client
+```bash
+--disable_target_subspace_projection
+```
 
-`system/flcore/clients/clientauditfu.py`
+则主路径会退化为 no-projection variant，语义上等价于 `SR-AuditFU-Core`。
 
-负责 PFLlib 版本客户端侧训练和 repair：
+## 5. 指标解释
 
-- 复用 FedRep 风格本地训练。
-- 在 repair 阶段保留 pre-unlearn encoder 作为参考。
-- 添加 feature mean 和 coordinate variance 稳定项。
-- 支持 adversarial confusion、DV mutual information、proximal loss、direction penalty 等增强项。
+### Utility
 
-### Standalone 多数据集实验
+- `R-Acc`：retained clients 平均准确率，越高越好。
+- `Target-Acc`：target client accuracy。它不是 attack success rate，不能叫 ASR，也不能直接代表攻击成功率。
+- `ASR_deprecated_alias_of_Target_Acc`：兼容旧脚本的 deprecated alias，不建议在论文中使用。
 
-`system/experiments/standalone_cifar10_fedrep_srauditfu.py`
+### Forgetting
 
-这是当前仓库最容易直接运行的入口，功能包括：
+- `MIA-AUC`：成员推断 AUC，越接近 0.5 越接近不可区分。
+- `TIA-AUC`：任务/客户端推断 AUC，越接近 0.5 越接近不可区分。当前判定建议使用 `abs(TIA-AUC - 0.5) <= task_auc_tolerance`，避免 AUC 过低被误读。
+- `Target-CKA`：目标客户端遗忘前后表征相似度，较低通常表示目标表征影响变化更明显。
+- `Retain-CKA` 或 `CKA`：retained clients 遗忘前后表征相似度，越高表示 retained 表征越稳定。
+- `Target/Retain-CKA`：目标变化和 retained 稳定性的相对指标，越低越符合“忘 target、保 retained”。
 
-- 下载或读取 MNIST、Fashion-MNIST、CIFAR-10、CIFAR-100、FEMNIST 代理数据。
-- Dirichlet 或 pathological non-IID 客户端划分。
-- small CNN encoder 或 ResNet-18 encoder，默认使用 GroupNorm，避免 BatchNorm running statistics 在联邦聚合中失效。
-- FedRep 风格训练。
-- 确定性可审计客户端选择。
-- MCR + masked target subspace。
-- UCE + OSD 主动遗忘。
-- retained repair + FedOSD recovery 投影 + target subspace server projection。
-- 多维度指标计算。
-- 输出 `metrics.json`、`metrics_flat.csv`、`evidence.json`。
+### Dist-to-theta_T
 
-### PFLlib 启动器
+`Dist-to-theta_T` 只衡量当前共享 encoder 参数相对污染模型 `theta_T` 的偏离。距离更大不必然代表遗忘更好。它是辅助诊断指标，必须和 `MIA-AUC`、`TIA-AUC`、`Target-CKA`、`Retain-CKA` 以及 retained utility 一起解释。
 
-`system/experiments/run_srauditfu.py`
+### Retrain Consistency
 
-负责把实验参数转发给 PFLlib 的 `system/main.py`。如果使用完整 PFLlib 框架，通常从这个文件或 shell 脚本启动。
+当 `Retrain` baseline 可用时，SR-AuditFU 会额外输出：
 
-### 运行脚本
+- `Agreement-to-Retrain`：在 retained clients 测试集上，SR-AuditFU 与 Retrain 预测类别一致率。
+- `KL-to-Retrain`：Retrain logits 到 SR-AuditFU logits 的平均 KL divergence，越低越接近。
+- `CKA-to-Retrain`：二者 shared encoder embeddings 的 CKA。
+- `ParamDist-to-Retrain`：二者共享 encoder 参数距离。
 
-`system/scripts/run_srauditfu_cifar10.sh`
+如果跳过 Retrain，这些字段会输出 `null` 或 `not_available`，不会导致程序崩溃。
 
-提供旧版 CIFAR-10 + Dirichlet non-IID 的示例命令。
+### AuditPass 和 audit_score
 
-`system/scripts/run_srauditfu_osd_cifar10_pat.sh`
+- `AuditPass`：hash-chain、Merkle root、repair 记录等执行审计是否通过。
+- `audit_score.score_sr_auditfu`：综合 summary score，用于快速筛查实验质量。
 
-提供按研究报告和 FedOSD README 对齐的 CIFAR-10 pathological `NC=2` 示例命令。
+`audit_score` 不能替代分项指标。论文主表和分析必须同时报告 retained utility、MIA、TIA、CKA、Retrain consistency 和系统成本。
 
-`system/scripts/sweep_resnet18_cifar10_lrs.sh`
+当 Retrain 可用时，summary score 会纳入 retrain consistency：
 
-提供 ResNet-18 CIFAR-10 学习率 sweep 示例。
+```text
+0.25 * TIA score
++ 0.25 * MIA score
++ 0.20 * Target-CKA score
++ 0.15 * Retain-CKA score
++ 0.15 * Retrain consistency score
+```
 
-## 环境要求
+当 Retrain 不可用时，summary score 自动回退到不含 consistency 的版本。
 
-项目主要依赖：
+## 6. 快速运行
 
-- Python 3.10 或更高版本。
-- PyTorch。
-- torchvision。
-- NumPy。
-
-如果使用 standalone CIFAR-10 路径，当前仓库已经可以直接运行，不需要完整 PFLlib checkout。
-
-如果第一次运行本地没有 CIFAR-10 数据，需要加 `--download`。在当前受限环境中，建议优先使用已经存在的 `data/` 目录，避免网络下载失败。
-
-## 快速验证
-
-最小 smoke test：
+### 6.1 Smoke Test
 
 ```bash
 PYTHONPATH=system python -B system/experiments/standalone_cifar10_fedrep_srauditfu.py \
@@ -201,410 +213,106 @@ PYTHONPATH=system python -B system/experiments/standalone_cifar10_fedrep_sraudit
   --auditfu_log_dir results/smoke_report_mods
 ```
 
-这个命令只用于确认代码链路能跑通，不用于报告正式结果。它会执行 1 轮训练和 1 轮 repair，并输出：
+该命令用于确认代码链路能跑通，不用于正式论文结果。主方法默认启用 target-subspace projection。
+
+输出文件：
 
 ```text
 results/smoke_report_mods/evidence.json
 results/smoke_report_mods/metrics.json
 results/smoke_report_mods/metrics_flat.csv
+results/smoke_report_mods/checkpoints/
 ```
 
-成功运行后，重点检查：
+### 6.2 ZK-MCR Prototype Smoke Test
 
-- `execution_audit.exec_audit_pass` 是否为 `true`。
-- `execution_audit.round_records` 是否等于训练轮数。
-- `execution_audit.repair_round_records` 是否等于 repair 轮数。
-- `baselines` 是否包含 `Retrain`、`NoUnlearn`、`Fine-tune`、`MCR-only`、`FedOSD-Adapted`、`SR-AuditFU`、`SR-AuditFU-Core` 中已启用的方法。
-- `report_metrics` 是否包含 `R-Acc`、`ASR`、`MIA-AUC`、`TIA-AUC`、`CKA`、`Dist-to-theta_T`、`AuditPass`。
-- `audit_score.score_valid` 是否为 `true`。如果为 `false`，先看 `audit_score.invalid_reasons`，不要直接解释遗忘指标。
-
-## 研究报告版实验设计
-
-新报告要求实验设置与 FedOSD 尽量对齐，同时保留共享表征个性化 FL 和可审计设计。当前代码的默认设置已经调整为：
-
-- 数据集：`mnist`、`fashionmnist`、`cifar10`、`cifar100`、`femnist`。
-- 划分：`pathological` 和 `dirichlet`。
-- pathological 默认 `classes_per_client=2`，对应 FedOSD README 的 `NC=2`。
-- 客户端数默认 `N=100`。
-- 参与率默认 `C=0.1`，即每轮约 10 个客户端参与。
-- 预遗忘训练轮数默认 `global_rounds=50`，对应报告中“100 轮训练、50 轮后触发遗忘”的前半段。
-- repair 默认 `repair_rounds=20`。
-- mask 默认 top-10%，即 `auditfu_topk_ratio=0.1`。
-- 贡献子空间 PCA/SVD rank 默认 `auditfu_subspace_rank=20`。
-- OSD 学习率默认 `osd_lr=0.0004`，仅用于 `FedOSD-Adapted` baseline 或显式 `--enable_osd` 的 ablation。
-
-注意：`--dataset femnist` 当前使用 torchvision `EMNIST(split="byclass")` 作为可运行代理，并继续使用本脚本的 Dirichlet/pathological 联邦划分；它不是 LEAF FEMNIST 的原始 writer-natural split。
-
-推荐的 CIFAR-10 pathological `NC=2` 命令：
+ZK-MCR 默认关闭。开启 prototype verifier：
 
 ```bash
-bash system/scripts/run_srauditfu_osd_cifar10_pat.sh
-```
-
-等价展开命令：
-
-```bash
-PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_srauditfu.py \
-  --dataset cifar10 \
-  --model small_cnn \
-  --device auto \
-  --num_clients 100 \
-  --join_ratio 0.1 \
-  --global_rounds 50 \
-  --total_rounds 100 \
-  --repair_rounds 20 \
+PYTHONPATH=system python -B system/experiments/standalone_cifar10_fedrep_srauditfu.py \
+  --device cpu \
+  --num_clients 3 \
+  --join_ratio 0.67 \
+  --global_rounds 1 \
+  --repair_rounds 1 \
   --head_epochs 1 \
   --encoder_epochs 1 \
-  --batch_size 200 \
-  --lr_head 0.05 \
-  --lr_encoder 0.05 \
-  --split_mode pathological \
-  --classes_per_client 2 \
-  --target_client 0 \
-  --auditfu_mask topk \
-  --auditfu_topk_ratio 0.1 \
-  --auditfu_subspace_rank 20 \
-  --osd_lr 0.0004 \
-  --osd_retain_clients 10 \
-  --repair_strength 0.2 \
-  --repair_kd_lambda 0.5 \
-  --repair_feat_lambda 0.5 \
-  --repair_var_lambda 0.1 \
-  --auditfu_log_dir results/srauditfu_osd_cifar10_pat_n100_nc2_c01
-```
-
-如果机器没有 GPU，这个命令会很慢。调试时建议加：
-
-```bash
---num_clients 10 --global_rounds 2 --repair_rounds 1 --baseline_rounds 1 --skip_retrain_baseline --max_train_samples 1000 --max_test_samples 500
-```
-
-报告要求的 baseline 当前对应如下：
-
-- `Retrain`：从头训练 retained clients。
-- `NoUnlearn`：不执行遗忘。
-- `Fine-tune`：UCE-only target update，不做 OSD 和 repair。
-- `MCR-only`：只做贡献移除。
-- `MCR+Repair`：MCR 后做 KD/feature/prox repair，但不做 OSD 和目标子空间投影。该设置与 `SR-AuditFU-Core` 的性能路径高度重叠，默认不跑；需要复核冗余 ablation 时加 `--include_redundant_baselines`。
-- `FedOSD-Adapted`：直接对共享编码器做 UCE/OSD，不做 MCR 和 SR-AuditFU 子空间 repair。
-- `SR-AuditFU`：原始 MCR + target-subspace projected repair，不含 UCE/OSD。
-- `SR-AuditFU-Core`：本文默认主方法，auditable logging + top-k MCR + retained-client KD/feature/prox repair。
-
-## ResNet-18 版本
-
-如果希望使用更强的共享编码器，可以选择 ResNet-18。根据当前 10 客户端、全量 CIFAR-10 实验结果，推荐优先运行三核心模块版配置：
-
-```bash
-PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_srauditfu.py \
-  --data_dir /root/autodl-tmp/VFU_data \
-  --download \
-  --dataset cifar10 \
-  --model resnet18 \
-  --device cuda \
-  --num_clients 10 \
-  --join_ratio 0.4 \
-  --participation_mode force_target \
-  --target_client 0 \
-  --max_rounds 100 \
-  --global_rounds 100 \
-  --global_min_rounds 50 \
-  --early_stop_patience 5 \
-  --repair_rounds 100 \
-  --repair_early_stop_patience 5 \
-  --head_epochs 1 \
-  --encoder_epochs 1 \
-  --batch_size 32 \
-  --embedding_dim 128 \
-  --split_mode pathological \
-  --classes_per_client 2 \
+  --batch_size 64 \
+  --embedding_dim 32 \
+  --max_train_samples 300 \
+  --max_test_samples 150 \
+  --max_audit_batches 2 \
+  --new_client_adapt_steps 1 \
+  --alpha 0.5 \
+  --baseline_rounds 1 \
+  --retrain_rounds 1 \
   --auditfu_mask topk \
   --auditfu_topk_ratio 0.2 \
-  --auditfu_mcr_strength 1.0 \
-  --auditfu_subspace_rank 20 \
-  --disable_osd \
-  --repair_strength 0.10 \
-  --repair_kd_lambda 0.5 \
-  --repair_kd_temp 2.0 \
-  --repair_feat_lambda 2.0 \
-  --repair_var_lambda 0.0 \
-  --repair_prox_lambda 0.08 \
-  --repair_subspace_lambda 0.0 \
-  --task_auc_tolerance 0.05 \
-  --retrain_rounds 100 \
-  --retrain_join_ratio 1.0 \
-  --retrain_encoder_epochs 2 \
-  --retrain_lr_encoder 0.01 \
-  --auditfu_log_dir results/resnet18_cifar10_pat_core
+  --enable_zk_mcr \
+  --zk_mcr_mode prototype \
+  --auditfu_log_dir results/smoke_zk_mcr
 ```
 
-也可以直接运行脚本：
+开启后，`metrics.json` 和 `evidence.json` 会包含：
+
+```json
+"zk_mcr": {
+  "enabled": true,
+  "mode": "prototype",
+  "proved_relation": "MCR execution correctness only",
+  "proves_training": false,
+  "proves_repair": false,
+  "proves_mcr": true
+}
+```
+
+如果未开启，则输出：
+
+```json
+"zk_mcr": {
+  "enabled": false,
+  "reason": "ZK-MCR is an optional enhancement; the default audit layer is hash-chain/Merkle evidence."
+}
+```
+
+### 6.3 ResNet-18 全量 CIFAR-10 推荐脚本
 
 ```bash
 bash system/scripts/run_resnet18_cifar10_pat_forgetting_tuned.sh
 ```
 
-脚本默认读取服务器上的 `/root/autodl-tmp/VFU_data`，结果默认写入 `/root/autodl-tmp/VFU_results/resnet18_cifar10_pat_core`。如果你的服务器路径不同，可以这样覆盖：
-
-```bash
-DATA_DIR=/your/cifar10/path LOG_DIR=/your/result/path bash system/scripts/run_resnet18_cifar10_pat_forgetting_tuned.sh
-```
-
-这组参数相对上一轮 OSD-heavy 结果做了五个调整：
-
-- `--disable_osd` 和 `repair_subspace_lambda=0.0`：默认主链路只保留三核心模块，OSD 和 target-subspace projection 放入 ablation。
-- `join_ratio=0.4`：每轮选择 4/10 个客户端，降低 2/10 参与率下的高方差震荡，同时仍保留部分参与的联邦设定。
-- `auditfu_mcr_strength=1.0`：避免过强 MCR 同时破坏 retained 表征。
-- `max_rounds=100`、`global_min_rounds=50`、`early_stop_patience=5`、`repair_early_stop_patience=5`：所有循环阶段最多 100 轮；主训练至少 50 轮；早停条件改为准确率连续 5 轮下降，而不是连续 5 轮没有超过历史最佳。
-- `repair_strength=0.10`、`repair_feat_lambda=2.0`、`repair_prox_lambda=0.08`：进一步降低单轮写回幅度，提高 retained 表征约束和参数稳定约束。
-- `repair_var_lambda=0.0`：默认移除 variance/CORAL 项，降低 repair 正则冗余。
-- `task_auc_tolerance=0.05`：将 TIA 判定改为 `abs(TIA-AUC - 0.5) <= 0.05`，避免 AUC 过低时被误判为真正不可区分。
-- `retrain_rounds=100`、`retrain_join_ratio=1.0`、`retrain_encoder_epochs=2`、`retrain_lr_encoder=0.01`：将 `Retrain` 作为更强的 oracle upper-bound baseline，避免因训练不足导致上界偏低。该设置的通信和训练预算高于主方法，不应作为同预算 baseline 解读。
-
-训练、repair 和 retrain 都会保存最佳 checkpoint，默认位于：
-
-```text
-<auditfu_log_dir>/checkpoints/
-```
-
-常用文件包括：
-
-```text
-train_best.pt
-repair_SR-AuditFU-Core_best.pt
-Retrain_best.pt
-```
-
-下一次可以从某个最佳模型继续：
-
-```bash
-PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_srauditfu.py \
-  --init_checkpoint /root/autodl-tmp/VFU_results/resnet18_cifar10_pat_core/checkpoints/train_best.pt \
-  ...
-```
-
-注意：ResNet-18 在 CPU 上会明显更慢，建议有 GPU 时再跑完整配置。
-
-## 输出文件说明
-
-每次 standalone 运行会在 `--auditfu_log_dir` 下写出指标文件，并在 `checkpoints/` 中保存最佳模型参数。
-
-### evidence.json
-
-这是审计证据包，包含：
-
-- `config`：本次 SR-AuditFU 配置。
-- `rounds`：训练阶段每轮审计记录。
-- `repair_rounds`：repair 阶段每轮审计记录。
-- `client_updates`：客户端共享编码器更新的摘要记录。
-- `extra`：数据集、算法、目标客户端、basis rank、指标文件名等元数据。
-
-重点字段：
-
-- `state_hash_before`：本轮聚合前共享编码器哈希。
-- `state_hash_after`：本轮聚合后共享编码器哈希。
-- `update_root`：本轮客户端 update hash 的 Merkle root。
-- `vrf_seed`：可重放调度使用的公开 seed。
-- `prev_chain_hash`：上一条记录的 chain hash。
-- `chain_hash`：当前记录的 chain hash。
-- `target_basis_hash`：repair 轮次绑定的目标子空间哈希。
-
-### metrics.json
-
-这是嵌套结构的完整指标文件，适合程序读取和论文表格整理。
-
-主要分组：
-
-- `utility`
-- `forgetting`
-- `representation`
-- `execution_audit`
-- `report_metrics`
-- `baselines`
-- `audit_score`
-- `system_cost`
-- `threshold_checks`
-- `metadata`
-
-### metrics_flat.csv
-
-这是扁平化指标文件，一行一个指标，适合导入 Excel、pandas 或画图脚本。
-
-## 关键指标解释
-
-### utility
-
-用于衡量 retained clients 的可用性。
-
-- `weighted_acc`：按样本数加权的总体准确率。
-- `mean_client_acc`：客户端平均准确率。
-- `retain_mean_acc`：非目标客户端平均准确率。
-- `target_client_acc`：目标客户端准确率。
-- `macro_f1`：宏平均 F1。
-- `new_client_adaptation_*`：新客户端只训练本地头后的适配能力。
-
-### forgetting
-
-用于衡量目标客户端信息是否被削弱。
-
-- `task_inference_auc_post`：遗忘后的 task inference AUC，越接近 0.5 越好。
-- `mia_auc_post_loss`：基于 loss 的 membership inference AUC，越接近 0.5 越好。
-- `target_cka_pre_to_post`：目标客户端遗忘前后 embedding 相似度，越低表示变化越大。
-- `retain_cka_pre_to_post_mean`：retained clients 遗忘前后 embedding 相似度，越高表示保留越稳定。
-- `target_to_retain_cka_ratio`：目标变化与 retained 变化的相对比值。
-- `mask_sparsity`：mask 稀疏度。
-
-### representation
-
-用于黑盒表征审计。
-
-- `coordinate_variance`：目标 embedding 的坐标方差。
-- `pairwise_inner_abs_mean`：目标 embedding 成对内积绝对值均值。
-- `mean_mahalanobis`：目标 embedding 与参考 retained embedding 的 Mahalanobis 距离。
-- `linear_cka_to_reference`：目标 embedding 与参考 retained embedding 的 CKA。
-- `target_pairwise_inner_within_retain_95ci`：目标统计量是否落入 retained 分布的 95% 区间。
-
-### execution_audit
-
-用于确认执行过程是否可验证。
-
-- `exec_audit_pass`：训练和 repair hash-chain 是否通过验证。
-- `round_records`：训练轮记录数。
-- `repair_round_records`：repair 轮记录数。
-- `client_update_records`：客户端 update 记录数。
-- `chain_verification_rate`：chain 验证通过率。
-- `merkle_root_presence_rate`：训练轮 Merkle root 存在率。
-- `vrf_seed_presence_rate`：训练轮 VRF seed 存在率。
-- `repair_vrf_seed_presence_rate`：repair 轮 VRF seed 存在率。
-
-### report_metrics
-
-这是最贴近研究报告表格的指标分组。
-
-- `R-Acc`：retained clients 平均准确率，越高越好。
-- `ASR`：目标客户端攻击成功率，这里用目标客户端测试准确率近似，越低表示遗忘越彻底。
-- `MIA-AUC`：成员推断 AUC，越接近 0.5 越好。
-- `TIA-AUC`：任务推断 AUC，越接近 0.5 越好。
-- `CKA`：retained clients 遗忘前后表征相似度，越高表示保留越稳定。
-- `Dist-to-theta_T`：遗忘模型和遗忘前污染模型的相对参数距离，越大表示离原目标影响越远。
-- `AuditPass`：执行审计是否通过，通过为 1，否则为 0。
-
-`report_metrics.baselines` 会对每个 baseline 输出同一组核心对比项：
-
-- `R-Acc`、`ASR`：utility 和目标客户端残留表现。
-- `MIA-AUC`、`TIA-AUC`：遗忘侧攻击指标，越接近 0.5 越好。
-- `CKA`：retained clients 表征保持程度，越高越好。
-- `Target-CKA`：目标客户端遗忘前后表征相似度，越低通常表示目标影响移除更彻底。
-- `Target/Retain-CKA`：目标变化与 retained 稳定性的相对关系，越低越符合“忘 target、保 retained”的目标。
-- `Dist-to-theta_T`：相对于遗忘前共享模型的参数距离。
-
-这项改动用于避免只按 retained accuracy 排序。比如 `FedOSD-Adapted` 可能拥有更高的 `R-Acc`，但如果 `TIA-AUC`、`Target-CKA` 或 `Target/Retain-CKA` 更差，就不能说明它整体优于 SR-AuditFU-Core。
-
-在 `threshold_checks` 中，推荐优先看 `task_inf_post_mahalanobis_abs_le_tol`，它使用双侧判据：
-
-```text
-abs(TIA-AUC - 0.5) <= task_auc_tolerance
-```
-
-旧字段 `task_inf_post_mahalanobis_le_0_55` 会保留用于兼容历史结果，但它只检查 AUC 是否小于 0.55，无法区分 `0.50` 和明显低于随机的 `0.34`。
-
-### baselines
-
-该分组保存所有启用方法的原始指标、history、诊断指标和说明。正式表格建议优先读取 `report_metrics.baselines`，需要细节时再查看 `baselines.<method>.diagnostics`。
-
-### audit_score
-
-根据报告中的综合评分思想输出：
-
-```text
-score_sr_auditfu =
-  exec_gate
-  * retain_score
-  * (0.4 * forgetting_score_tia
-     + 0.3 * forgetting_score_mia
-     + 0.3 * forgetting_score_cka)
-```
-
-其中：
-
-- `exec_gate`：执行审计是否通过，通过为 1，否则为 0。
-- `retain_score`：retained utility 保留比例。
-- `forgetting_score_tia`：task inference AUC 越接近 0.5 分数越高。
-- `forgetting_score_mia`：MIA AUC 越接近 0.5 分数越高。
-- `forgetting_score_cka`：目标 CKA 越低分数越高。
-
-这个分数适合做实验主表中的整体参考，但不能替代分项指标。论文分析时应同时报告 retained utility、MIA、task inference、CKA 和系统成本。
-
-## PFLlib 集成方式
-
-如果要把本方法放入完整 PFLlib，需要在 PFLlib 的 `system/main.py` 中加入：
-
-```python
-from flcore.servers.serverauditfu import SRAuditFU
-
-if args.algorithm == "SRAuditFU":
-    server = SRAuditFU(args, i)
-```
-
-如果 PFLlib 的 argparse 不接受未知参数，还需要加入：
-
-```python
-parser.add_argument("--target_client", type=int, default=0)
-parser.add_argument("--auditfu_mask", type=str, default="topk",
-                    choices=["full", "topk", "relative"])
-parser.add_argument("--auditfu_decay", type=float, default=0.95)
-parser.add_argument("--auditfu_mcr_strength", type=float, default=1.0)
-parser.add_argument("--auditfu_topk_ratio", type=float, default=0.2)
-parser.add_argument("--auditfu_relative_threshold", type=float, default=0.55)
-parser.add_argument("--auditfu_subspace_rank", type=int, default=8)
-parser.add_argument("--auditfu_lr_log_rank", type=int, default=512)
-parser.add_argument("--auditfu_repair_rounds", type=int, default=20)
-parser.add_argument("--auditfu_lambda_adv", type=float, default=0.2)
-parser.add_argument("--auditfu_lambda_mi", type=float, default=0.01)
-parser.add_argument("--auditfu_lambda_prox", type=float, default=1e-4)
-parser.add_argument("--auditfu_lambda_dir", type=float, default=0.1)
-parser.add_argument("--auditfu_lambda_kd", type=float, default=1.0)
-parser.add_argument("--auditfu_lambda_feat", type=float, default=0.1)
-parser.add_argument("--auditfu_lambda_var", type=float, default=0.1)
-parser.add_argument("--auditfu_kd_tau", type=float, default=2.0)
-parser.add_argument("--auditfu_direction_basis_path", type=str, default="")
-parser.add_argument("--auditfu_log_dir", type=str, default="results/sr_auditfu")
-```
-
-然后可以使用：
-
-```bash
-bash system/scripts/run_srauditfu_cifar10.sh
-```
-
-## 常见问题
-
-### 为什么只审计共享编码器，不审计本地头？
-
-在 FedRep/FedPer 这类个性化联邦学习中，本地头属于客户端私有参数。客户端退出后，本地头可以直接在客户端侧删除。真正被多个客户端共同训练、也可能携带目标客户端残留的是共享编码器。因此本项目把遗忘对象集中在 `model.base`。
-
-### 为什么默认用 top-k mask？
-
-full mask 会移除所有目标贡献，可能对 retained utility 伤害更大。top-k mask 只处理贡献绝对值最大的坐标，更符合“只移除最可能携带目标客户端信息的共享表示方向”的设计。当前默认 `topk_ratio=0.2`，即使用 20% 坐标。
-
-### repair 为什么要投影？
-
-如果只在 retained clients 上普通 fine-tune，模型可能沿着目标客户端历史贡献方向回弹。目标子空间投影会把聚合 repair update 中落在目标贡献子空间内的分量去掉，降低“遗忘后又恢复目标残留”的风险。
-
-### smoke test 指标不好是否代表方法失败？
-
-不代表。smoke test 使用极少样本和极少轮数，只用于验证代码链路。正式分析需要使用完整数据、足够训练轮数、多 seed 和基线对比。
-
-### CPU 能跑吗？
-
-能跑，但全量 CIFAR-10、50 轮训练、10 轮 repair 在 CPU 上会比较慢。ResNet-18 版本尤其建议使用 GPU。
-
-## 当前实现边界
-
-当前代码是研究原型，已经支持轻量可审计执行链和黑盒效果审计，但还不是强密码学系统：
-
-- VRF 当前是可重放的 hash-based deterministic scheduler，不是完整 RFC 9381 ECVRF。
-- Merkle root 和 hash-chain 用于研究级 evidence package，不包含完整链上或第三方公证流程。
-- low-rank log 目前用于存储估计和摘要，不是完整压缩恢复系统。
-- few-shot proxy mixup warm-up 目前没有作为默认路径启用，主流程是 MCR + masked subspace + retained repair。
-
-这些边界不影响当前实验运行，但在论文或报告中需要明确说明。
+脚本默认：
+
+- 10 clients；
+- pathological 2 classes/client；
+- full CIFAR-10；
+- `join_ratio=0.4`；
+- `global_rounds=100`，`global_min_rounds=50`；
+- `repair_rounds=100`；
+- early stop 为连续 5 轮准确率下降才停止；
+- top-k 20% mask；
+- target-subspace projection 默认启用；
+- ZK-MCR 默认关闭。
+
+## 7. 当前实现边界
+
+当前实现需要按以下边界解释：
+
+- 默认审计是 hash-chain / Merkle evidence，不是零知识证明。
+- ZK-MCR 是可选增强，只证明 MCR arithmetic correctness。
+- ZK-MCR 不证明 local training correctness。
+- ZK-MCR 不证明 full federated aggregation correctness。
+- ZK-MCR 不证明 retained-client repair correctness。
+- 当前 `vrf_seed` 是 VRF-style deterministic seed，不是完整 RFC 9381 ECVRF 实现。
+- 如果没有第三方公证、可信时间戳或外部提交机制，Merkle/hash-chain 不能防止服务器事后伪造一整套自洽日志。
+- `Dist-to-theta_T` 只是参数偏离诊断，不能单独作为遗忘成功证据。
+- `Target-Acc` 不是 ASR，不应在论文中写成 attack success rate。
+
+## 8. 文件职责
+
+- `system/experiments/standalone_cifar10_fedrep_srauditfu.py`：standalone CIFAR/FedRep 实验入口，负责训练、MCR、SR-AuditFU repair、baselines、指标和 evidence 输出。
+- `system/flcore/unlearning/auditfu.py`：审计日志、贡献估计、mask、MCR、target subspace、projection 和表示审计工具。
+- `system/flcore/unlearning/zk_mcr.py`：ZK-MCR proof relation spec 和 prototype verifier，不是 production zkSNARK。
+- `system/flcore/servers/serverauditfu.py`：PFLlib server 接入，负责共享 encoder 聚合、审计记录、MCR 和 retained repair projection。
+- `system/flcore/clients/clientauditfu.py`：PFLlib client 接入，负责 retained repair 的本地训练辅助损失。
+- `system/scripts/*.sh`：常用实验脚本。
