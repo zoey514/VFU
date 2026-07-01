@@ -985,7 +985,8 @@ def run_repair_procedure(
     best_heads = copy.deepcopy(heads)
     best_metrics = evaluate_personalized(best_model, best_heads, test_loaders, device, target_client)
     best_round = 0
-    stale_rounds = 0
+    previous_score = early_stop_score(best_metrics)
+    decline_rounds = 0
     history = []
     completed_rounds = 0
     best_checkpoint = checkpoint_path(args, f"repair_{safe_filename(label)}_best.pt")
@@ -1089,12 +1090,12 @@ def run_repair_procedure(
             f"time={elapsed:.1f}s"
         )
 
-        if early_stop_score(metrics) > early_stop_score(best_metrics) + args.early_stop_min_delta:
+        score = early_stop_score(metrics)
+        if score > early_stop_score(best_metrics) + args.early_stop_min_delta:
             best_metrics = metrics
             best_model = copy.deepcopy(model).to(device)
             best_heads = copy.deepcopy(heads)
             best_round = repair_id + 1
-            stale_rounds = 0
             if args.save_checkpoints:
                 save_experiment_checkpoint(
                     best_checkpoint,
@@ -1111,10 +1112,16 @@ def run_repair_procedure(
                         "used_teacher": bool(use_teacher),
                     },
                 )
+        if score < previous_score - args.early_stop_min_delta:
+            decline_rounds += 1
         else:
-            stale_rounds += 1
-        if args.repair_early_stop_patience >= 0 and stale_rounds >= args.repair_early_stop_patience:
-            print(f"{label} repair early stopped at round {repair_id + 1}; restoring best round {best_round}.")
+            decline_rounds = 0
+        previous_score = score
+        if args.repair_early_stop_patience >= 0 and decline_rounds >= args.repair_early_stop_patience:
+            print(
+                f"{label} repair early stopped at round {repair_id + 1} after "
+                f"{decline_rounds} consecutive score declines; restoring best round {best_round}."
+            )
             break
 
     final_metrics = evaluate_personalized(model, heads, test_loaders, device, target_client)
@@ -1152,7 +1159,8 @@ def run_training_baseline(
     best_metrics = evaluate_personalized(best_model, best_heads, test_loaders, device, target_client)
     best_score = -float("inf")
     best_round = 0
-    stale_rounds = 0
+    previous_score = early_stop_score(best_metrics)
+    decline_rounds = 0
     completed_rounds = 0
     best_checkpoint = checkpoint_path(args, f"{safe_filename(label)}_best.pt")
     if args.save_checkpoints:
@@ -1212,7 +1220,6 @@ def run_training_baseline(
             best_model = copy.deepcopy(baseline_model).to(device)
             best_heads = copy.deepcopy(baseline_heads)
             best_round = round_id + 1
-            stale_rounds = 0
             if args.save_checkpoints:
                 save_experiment_checkpoint(
                     best_checkpoint,
@@ -1224,10 +1231,16 @@ def run_training_baseline(
                     args,
                     {"reason": "best_baseline_accuracy", "label": label},
                 )
+        if score < previous_score - args.early_stop_min_delta:
+            decline_rounds += 1
         else:
-            stale_rounds += 1
-        if args.early_stop_patience >= 0 and stale_rounds >= args.early_stop_patience:
-            print(f"{label} early stopped at round {round_id + 1}; restoring best round {best_round}.")
+            decline_rounds = 0
+        previous_score = score
+        if args.early_stop_patience >= 0 and decline_rounds >= args.early_stop_patience:
+            print(
+                f"{label} early stopped at round {round_id + 1} after "
+                f"{decline_rounds} consecutive score declines; restoring best round {best_round}."
+            )
             break
     return {
         "rounds": int(max(0, rounds)),
@@ -1487,6 +1500,7 @@ def main() -> None:
     parser.add_argument("--num_clients", type=int, default=100)
     parser.add_argument("--join_ratio", type=float, default=0.1)
     parser.add_argument("--global_rounds", type=int, default=100)
+    parser.add_argument("--global_min_rounds", type=int, default=50)
     parser.add_argument("--total_rounds", type=int, default=100)
     parser.add_argument("--repair_rounds", type=int, default=100)
     parser.add_argument("--model", choices=["small_cnn", "resnet18"], default="small_cnn")
@@ -1566,6 +1580,7 @@ def main() -> None:
         args.repair_var_lambda = args.repair_coral_lambda
     args.max_rounds = max(1, int(args.max_rounds))
     args.global_rounds = min(max(0, int(args.global_rounds)), args.max_rounds)
+    args.global_min_rounds = min(max(0, int(args.global_min_rounds)), args.global_rounds)
     args.repair_rounds = min(max(0, int(args.repair_rounds)), args.max_rounds)
     if args.baseline_rounds >= 0:
         args.baseline_rounds = min(int(args.baseline_rounds), args.max_rounds)
@@ -1650,7 +1665,8 @@ def main() -> None:
     best_train_metrics = evaluate_personalized(global_model, client_heads, test_loaders, device, args.target_client)
     best_train_score = -float("inf")
     best_train_round = 0
-    train_stale_rounds = 0
+    previous_train_score = early_stop_score(best_train_metrics)
+    train_decline_rounds = 0
     completed_global_rounds = 0
     if args.save_checkpoints:
         save_experiment_checkpoint(
@@ -1726,7 +1742,6 @@ def main() -> None:
             best_train_score = score
             best_train_metrics = metrics
             best_train_round = round_id + 1
-            train_stale_rounds = 0
             if args.save_checkpoints:
                 save_experiment_checkpoint(
                     checkpoint_path(args, "train_best.pt"),
@@ -1738,12 +1753,21 @@ def main() -> None:
                     args,
                     {"reason": "best_retain_accuracy"},
                 )
+        if score < previous_train_score - args.early_stop_min_delta:
+            train_decline_rounds += 1
         else:
-            train_stale_rounds += 1
-        if args.early_stop_patience >= 0 and train_stale_rounds >= args.early_stop_patience:
+            train_decline_rounds = 0
+        previous_train_score = score
+        if (
+            args.early_stop_patience >= 0
+            and completed_global_rounds >= args.global_min_rounds
+            and train_decline_rounds >= args.early_stop_patience
+        ):
             print(
-                f"Training early stopped at round {round_id + 1}; "
-                f"best round {best_train_round}, best_retain={best_train_score:.4f}."
+                f"Training early stopped at round {round_id + 1} after "
+                f"{train_decline_rounds} consecutive score declines; "
+                f"best round {best_train_round}, best_retain={best_train_score:.4f}, "
+                f"min_rounds={args.global_min_rounds}."
             )
             break
     args.completed_global_rounds = completed_global_rounds

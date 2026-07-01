@@ -302,11 +302,12 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
   --model resnet18 \
   --device cuda \
   --num_clients 10 \
-  --join_ratio 0.2 \
+  --join_ratio 0.4 \
   --participation_mode force_target \
   --target_client 0 \
   --max_rounds 100 \
   --global_rounds 100 \
+  --global_min_rounds 50 \
   --early_stop_patience 5 \
   --repair_rounds 100 \
   --repair_early_stop_patience 5 \
@@ -318,15 +319,15 @@ PYTHONPATH=system python -u system/experiments/standalone_cifar10_fedrep_sraudit
   --classes_per_client 2 \
   --auditfu_mask topk \
   --auditfu_topk_ratio 0.2 \
-  --auditfu_mcr_strength 1.2 \
+  --auditfu_mcr_strength 1.0 \
   --auditfu_subspace_rank 20 \
   --disable_osd \
-  --repair_strength 0.12 \
+  --repair_strength 0.10 \
   --repair_kd_lambda 0.5 \
   --repair_kd_temp 2.0 \
-  --repair_feat_lambda 1.5 \
+  --repair_feat_lambda 2.0 \
   --repair_var_lambda 0.0 \
-  --repair_prox_lambda 0.05 \
+  --repair_prox_lambda 0.08 \
   --repair_subspace_lambda 0.0 \
   --task_auc_tolerance 0.05 \
   --retrain_rounds 100 \
@@ -351,9 +352,10 @@ DATA_DIR=/your/cifar10/path LOG_DIR=/your/result/path bash system/scripts/run_re
 这组参数相对上一轮 OSD-heavy 结果做了五个调整：
 
 - `--disable_osd` 和 `repair_subspace_lambda=0.0`：默认主链路只保留三核心模块，OSD 和 target-subspace projection 放入 ablation。
-- `auditfu_mcr_strength=1.2`：避免过强 MCR 同时破坏 retained 表征。
-- `max_rounds=100`、`early_stop_patience=5`、`repair_early_stop_patience=5`：所有循环阶段最多 100 轮；准确率连续 5 轮没有提升就早停。
-- `repair_strength=0.12`、`repair_feat_lambda=1.5`、`repair_prox_lambda=0.05`：降低单轮写回幅度并增强 retained 表征稳定。
+- `join_ratio=0.4`：每轮选择 4/10 个客户端，降低 2/10 参与率下的高方差震荡，同时仍保留部分参与的联邦设定。
+- `auditfu_mcr_strength=1.0`：避免过强 MCR 同时破坏 retained 表征。
+- `max_rounds=100`、`global_min_rounds=50`、`early_stop_patience=5`、`repair_early_stop_patience=5`：所有循环阶段最多 100 轮；主训练至少 50 轮；早停条件改为准确率连续 5 轮下降，而不是连续 5 轮没有超过历史最佳。
+- `repair_strength=0.10`、`repair_feat_lambda=2.0`、`repair_prox_lambda=0.08`：进一步降低单轮写回幅度，提高 retained 表征约束和参数稳定约束。
 - `repair_var_lambda=0.0`：默认移除 variance/CORAL 项，降低 repair 正则冗余。
 - `task_auc_tolerance=0.05`：将 TIA 判定改为 `abs(TIA-AUC - 0.5) <= 0.05`，避免 AUC 过低时被误判为真正不可区分。
 - `retrain_rounds=100`、`retrain_join_ratio=1.0`、`retrain_encoder_epochs=2`、`retrain_lr_encoder=0.01`：将 `Retrain` 作为更强的 oracle upper-bound baseline，避免因训练不足导致上界偏低。该设置的通信和训练预算高于主方法，不应作为同预算 baseline 解读。
